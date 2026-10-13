@@ -1,0 +1,10 @@
+{
+  "plugin": "t3code",
+  "version": "0.3.0",
+  "hermes_base_commit": "1fd18277267152893a8a24792b79213e7ca3f899",
+  "requires_hermes": ">=0.21.5",
+  "host_patch": "patches/hermes-native-runtime.patch",
+  "upstream_inspiration": "https://github.com/pingdotgg/t3code (MIT)",
+  "python_dependencies": ["claude-agent-sdk>=0.2.164,<0.3"],
+  "external_clis": ["claude (optional)", "muse (optional)", "Antigravity ACP runtime (downloaded at setup, pinned 1.3.0, sha256-verified)"]
+}

@@ -1,0 +1,6 @@
+[project]
+name = "hermes-plugin-claude-cli"
+version = "0.1.0"
+description = "Claude Code as a native Hermes Desktop agent runtime"
+requires-python = ">=3.11,<3.15"
+dependencies = ["claude-agent-sdk>=0.2.164,<0.3"]

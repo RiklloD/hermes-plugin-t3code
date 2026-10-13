@@ -1,0 +1,10 @@
+{
+  "name": "t3code",
+  "label": "T3 Code",
+  "description": "T3 Code for Hermes: Inbox, Usage, Orchestrator and Claude CLI, each switchable on its own.",
+  "icon": "Activity",
+  "version": "0.2.0",
+  "tab": { "path": "/t3code", "position": "end" },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

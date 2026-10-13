@@ -1,0 +1,143 @@
+name: t3code
+label: T3 Code
+kind: standalone
+version: 0.3.0
+description: >-
+  T3 Code for Hermes, as one plugin with independent features: Inbox (T3's thread sidebar with
+  snooze, settle and crash / usage-limit recovery), Usage (Claude Code, Codex and Z.ai tokens,
+  cost and live limits), Orchestrator (delegation to any provider and model, forks, durable
+  queues, recovery, schedules), and three native agents as model providers: Claude CLI (Claude
+  Code), Muse Code (Meta) and Antigravity (Google).
+  Each feature can be switched off on its own; a feature that breaks is contained and the others
+  keep working.
+author: Lorik Dalloshi
+requires_hermes: ">=0.21.5"
+provides_tools:
+  - t3_capabilities
+  - t3_delegate
+  - t3_task
+  - t3_thread
+  - t3_queue
+  - t3_schedule
+provides_hooks:
+  - pre_llm_call
+requires_env: []
+python_dependencies:
+  - "claude-agent-sdk>=0.2.164,<0.3"
+config_schema:
+  # ── features (one switch each; missing = on). Keys stay flat: the Hermes settings form
+  #    reads values by the literal key.
+  inbox:
+    type: boolean
+    default: true
+    label: Inbox
+    description: T3's thread sidebar (pinned, inbox, working, snoozed, settled) with crash and usage-limit recovery. Applies live.
+  usage:
+    type: boolean
+    default: true
+    label: Usage
+    description: Claude Code, Codex and Z.ai tokens, cost and live limits in Command Center → Usage. Applies live.
+  orchestrator:
+    type: boolean
+    default: true
+    label: Orchestrator
+    description: Delegated agents, forks and merge-back, durable queues, recovery and schedules (t3_* tools, /t3). Agent tools change after a backend restart.
+  claude_cli:
+    type: boolean
+    default: true
+    label: Claude CLI
+    description: Claude Code's native agent as the "Claude CLI" model provider. Applies after a backend restart.
+  muse_code:
+    type: boolean
+    default: true
+    label: Muse Code
+    description: Meta's Muse Code agent as the "Muse Code" model provider. Applies after a backend restart.
+  antigravity:
+    type: boolean
+    default: true
+    label: Antigravity
+    description: Google's official Antigravity ACP agent as the "Antigravity" model provider. Applies after a backend restart.
+  # ── Claude CLI ───────────────────────────────────────────────────────────────────────────
+  claude_executable:
+    type: string
+    default: claude
+    label: "Claude CLI · executable"
+    description: Path to the installed official Claude Code executable.
+  claude_config_directory:
+    type: string
+    default: ""
+    label: "Claude CLI · config directory"
+    description: Optional native Claude configuration directory (changing it needs a new chat).
+  claude_permission_mode:
+    type: string
+    default: default
+    choices: [default, acceptEdits, plan, dontAsk, auto, bypassPermissions]
+    label: "Claude CLI · permission mode"
+    description: Native Claude permission mode.
+  claude_auth_mode:
+    type: string
+    default: subscription
+    choices: [subscription, native]
+    label: "Claude CLI · auth mode"
+    description: subscription uses the native Claude login; native keeps configured API/backend overrides.
+  claude_setting_sources:
+    type: array
+    default: [user, project, local]
+    label: "Claude CLI · setting sources"
+    description: Native Claude settings sources.
+  # ── Muse Code ────────────────────────────────────────────────────────────────────────────
+  muse_binary_path:
+    type: string
+    default: ""
+    label: "Muse Code · binary path"
+    description: Path to the Muse Code binary (default muse on PATH). Sign in with muse login.
+  muse_runtime_mode:
+    type: string
+    default: approval-required
+    choices: [approval-required, full-access]
+    label: "Muse Code · runtime mode"
+    description: approval-required asks for unmatched tool use; full-access disables the sandbox and approves everything. Needs a new chat.
+  muse_reasoning_effort:
+    type: string
+    default: ""
+    choices: ["", minimal, low, medium, high, xhigh, max]
+    label: "Muse Code · reasoning effort"
+    description: Empty uses each model's own default. Unsupported values fall back to it.
+  # ── Antigravity ──────────────────────────────────────────────────────────────────────────
+  antigravity_auth_method:
+    type: string
+    default: oauth-personal
+    choices: [oauth-personal, oauth-business, gemini-api-key, agent-platform]
+    label: "Antigravity · sign-in method"
+    description: Google accounts use your subscription; API keys and Agent Platform bill usage. Changing it needs a new chat.
+  antigravity_api_key:
+    type: string
+    default: ""
+    label: "Antigravity · API key"
+    description: Gemini or Vertex AI express key (gemini-api-key / agent-platform). Stored in plain text in config.
+  antigravity_gcp_project:
+    type: string
+    default: ""
+    label: "Antigravity · GCP project"
+    description: Gemini Enterprise / Agent Platform project.
+  antigravity_gcp_location:
+    type: string
+    default: ""
+    label: "Antigravity · GCP location"
+    description: Gemini Enterprise / Agent Platform location.
+  antigravity_runtime_mode:
+    type: string
+    default: approval-required
+    choices: [approval-required, auto-accept-edits, full-access]
+    label: "Antigravity · runtime mode"
+    description: Native permission mode (default / auto_edit / yolo).
+  antigravity_binary_path:
+    type: string
+    default: ""
+    label: "Antigravity · binary path"
+    description: Manual agy_acp_server install (localharness_external beside it). Empty uses the managed runtime.
+  antigravity_profile_directory:
+    type: string
+    default: ""
+    label: "Antigravity · profile directory"
+    description: GEMINI_HOME holding the Google sign-in, shared by every Hermes profile. Empty = ~/.hermes/plugin-data/t3code/antigravity/profile.
