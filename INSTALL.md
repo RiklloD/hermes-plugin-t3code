@@ -6,8 +6,6 @@ at any STOP condition instead of working around it.
 
 ## Hard rules
 
-- MUST quit the Hermes app/backend before applying the host patch or replacing the plugin. Ask
-  the user to quit it; verify it is not running before continuing.
 - MUST NOT edit `desktop-plugins/t3code/plugin.js` or `plugins/t3code/dashboard/dist/index.js`.
   Both are generated files (source of truth: `plugins/t3code/scripts/build.mjs`).
 - MUST NOT delete or move anything under `~/.hermes/plugin-data/`, `~/.hermes/profiles/`, or any
@@ -29,7 +27,7 @@ PATCH=$REPO/patches/hermes-native-runtime.patch
 
 ## Step 0 — Preflight
 
-Run all of these; every one must pass before Step 1.
+Run all of these; every one must pass before continuing.
 
 ```sh
 test -d "$AGENT/.git"                                   # Hermes source checkout exists
@@ -45,12 +43,6 @@ command -v git >/dev/null
 - Record the Hermes commit. It is expected to be the `hermes_base_commit` in `SOURCE.json`
   (`1fd18277267152893a8a24792b79213e7ca3f899`). A different commit is not an automatic failure,
   but Step 2 decides.
-
-## Step 1 — Confirm Hermes is not running
-
-Check for a running Hermes backend/desktop process (e.g. `pgrep -fl hermes`). If anything is
-running: ask the user to quit Hermes completely, wait for confirmation, re-check. MUST NOT
-kill the user's Hermes processes yourself.
 
 ## Step 2 — Host patch (required, idempotent)
 
@@ -153,7 +145,7 @@ not replace it.
 
 ## Updating
 
-Re-run Steps 1–3 on a fresh clone/pull. If Hermes itself was updated, Step 2 decides whether
+Re-run Steps 2–3 on a fresh clone/pull. If Hermes itself was updated, Step 2 decides whether
 the patch still applies. The Desktop bundle hot-reloads; Python changes need a backend restart.
 
 ## Uninstall
@@ -165,7 +157,7 @@ the patch still applies. The Desktop bundle hot-reloads; Python changes need a b
 Moves the plugin and Desktop bundle into `~/.hermes/backups/`, removes only the provider
 symlinks this plugin created, and leaves account data, other profiles and the host patch
 untouched. Reverting the host patch is a separate, user-only decision:
-`git -C "$AGENT" apply --reverse "$PATCH"` with Hermes quit.
+`git -C "$AGENT" apply --reverse "$PATCH"`.
 
 ## Report format
 
