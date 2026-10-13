@@ -16,14 +16,13 @@ T3 Code's features for [Hermes Agent](https://github.com/NousResearch/hermes-age
 ```sh
 git clone https://github.com/RiklloD/hermes-plugin-t3code.git
 cd hermes-plugin-t3code
+# Quit Hermes before patching. Skip these two commands if this exact patch is already applied.
+git -C ~/.hermes/hermes-agent apply --check "$PWD/patches/hermes-native-runtime.patch"
+git -C ~/.hermes/hermes-agent apply "$PWD/patches/hermes-native-runtime.patch"
 ./install.sh            # or: ./install.sh /path/to/.hermes
 ```
 
-`install.sh` does three things, in this order:
-
-1. **Applies `patches/hermes-native-runtime.patch`** to `~/.hermes/hermes-agent` (checked first; it stops if your Hermes has moved on — see “Host patch” below). Without this patch the three native providers cannot register.
-2. Copies `plugins/t3code` → `~/.hermes/plugins/t3code` and the **prebuilt** Desktop bundle → `~/.hermes/desktop-plugins/t3code/plugin.js` (no Node build needed; bundle sources and `scripts/build.mjs` are included).
-3. Installs `claude-agent-sdk>=0.2.164,<0.3` into Hermes's Python if it is missing (also declared in `plugin.yaml`).
+The host patch is required for the three native providers and targets the Hermes commit listed below. The installer checks it is applied, backs up any existing plugin, then copies the complete plugin and prebuilt Desktop bundle. Install the declared `claude-agent-sdk>=0.2.164,<0.3` dependency through Hermes's plugin manager. No Node build is needed to use the included bundle.
 
 Then restart the Hermes backend and enable **T3 Code** in Capabilities ▸ Plugins. Toggles per feature: Capabilities ▸ Plugins ▸ T3 Code ▸ settings, or Settings ▸ Plugins ▸ T3 Code. Inbox/Usage apply live; Orchestrator tools and the providers apply after a backend restart.
 
@@ -31,8 +30,9 @@ Then restart the Hermes backend and enable **T3 Code** in Capabilities ▸ Plugi
 
 - **Claude CLI:** install [Claude Code](https://claude.com/product/claude-code), run `claude` once and sign in.
 - **Muse Code:** put `muse` on `PATH`, run `muse login`.
-- **Antigravity:** the agent runtime downloads itself on first use (pinned 1.3.0, checksum-verified; also reuses a runtime already downloaded by T3 Code under `~/.t3/tools/antigravity-acp`). Sign in with:
+- **Antigravity:** first install the pinned, checksum-verified 1.3.0 runtime (skip this if T3 Code already downloaded it under `~/.t3/tools/antigravity-acp`), then sign in:
   ```sh
+  <hermes python> ~/.hermes/plugins/t3code/features/antigravity/setup.py install
   <hermes python> ~/.hermes/plugins/t3code/features/antigravity/setup.py login
   ```
   or simply open an Antigravity chat — sign-in opens in the browser on the first turn. The sign-in is shared by every Hermes profile (`~/.hermes/plugin-data/t3code/antigravity/profile`) and kept separate from the Antigravity IDE/CLI and from T3 Code.
@@ -84,7 +84,7 @@ node ~/.hermes/plugins/t3code/tests/desktop/isolation.mjs        # desktop isola
 ## Uninstall
 
 ```sh
-./uninstall.sh   # removes plugin + Desktop bundle + provider links, reverses the host patch
+./uninstall.sh   # moves plugin/UI into a backup; leaves account data, other profiles and the host patch untouched
 ```
 
 ## Attribution
