@@ -37,18 +37,3 @@ depends on the app's overlay structure; updates should be smoke-tested rather
 than assumed compatible. Backend changes require a backend restart; desktop
 changes hot-reload.
 
-## Verification
-
-A React + jsdom regression check exercises the actual desktop component with a
-mock SDK, navigation by `pushState`, and a first-frame assertion:
-
-```bash
-node ~/.hermes/plugins/t3code/features/usage/tests/desktop/flicker.cjs
-```
-
-It resolves React, jsdom and esbuild from the local Hermes source tree. Set
-`HERMES_SOURCE_ROOT` and `T3_USAGE_DESKTOP_FILE` for nonstandard paths.
-
-Expected: stock panel hidden before first paint, normal content restored when
-switching away, and no duplicate panels after reopening. Subscription values
-were also read back in the running desktop app.

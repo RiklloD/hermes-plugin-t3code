@@ -50,8 +50,3 @@ T3 Code's orchestration V2, built into the Hermes chat. A feature of the `t3code
 - Webhook URLs are loopback. Put your own tunnel in front for internet senders, and always set a signature.
 - After updating the plugin's code, restart the backend. The core is loaded once per process.
 
-## Tests
-
-```
-HERMES_HOME=$(mktemp -d) hermes-agent/scripts/run-in-hermes-env bash -c '"$__HERMES_TEST_PYTHON" -m pytest plugins/t3code/features/orchestrator -q'
-```

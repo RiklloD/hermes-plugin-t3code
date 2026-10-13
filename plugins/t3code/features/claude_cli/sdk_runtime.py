@@ -55,6 +55,7 @@ class ClaudeRuntime(NativeAgentRuntime):
         self._active_events = None
         self._worker_error = None
         self._interrupt_pending = threading.Event()
+        self.commands = None  # Claude Code's own slash commands, once connected (Hermes's slash menu)
         context = contextvars.copy_context()
         self._thread = threading.Thread(target=lambda: context.run(self._thread_main),
                                         name="claude-cli-runtime", daemon=True)
@@ -92,6 +93,11 @@ class ClaudeRuntime(NativeAgentRuntime):
         async with AsyncExitStack() as stack:
             client = await stack.enter_async_context(ClaudeSDKClient(options))
             self._client = client
+            try:
+                from .commands import remember
+                self.commands = remember(self.settings, self.cwd, await client.get_server_info())
+            except Exception:
+                pass  # the slash menu falls back to the cached list
             self._ready.set()
             while True:
                 command = await asyncio.to_thread(self._commands.get)

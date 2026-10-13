@@ -19,6 +19,12 @@ if "agent_runtime" not in ProviderProfile.__dataclass_fields__:
 
 
 class ClaudeCLIProfile(ProviderProfile):
+    slash_namespace = "claude"
+
+    def slash_commands(self, *, cwd="", runtime=None, **_):
+        from .commands import slash_commands
+        return slash_commands(cwd, runtime)
+
     def create_agent_runtime(self, **kwargs):
         from .sdk_runtime import ClaudeRuntime
         from .options import settings_for_profile

@@ -56,14 +56,4 @@ Native settings, CLAUDE.md, hooks, skills and configured MCP servers are handled
 - `plugins.isolation: host` is not supported for session-owned runtimes. The plugin runs in-process and owns one separate Claude process per active conversation.
 - Desktop JSON-RPC and picker integration have been exercised with the real CLI. The packaged Electron window has not been visually tested or activated in the user's normal installation.
 
-## Development
-
-With patched Hermes and this plugin's declared SDK dependency available in the interpreter:
-
-```sh
-python -m unittest discover -s tests -v
-```
-
-Host contract/regression tests live in the host patch under `tests/agent/test_native_runtime.py`; run them with Hermes's canonical `scripts/run_tests.sh`. See the bundle's `VALIDATION.md` for actual live checks and receipts.
-
 The design follows T3 Code's official-SDK/native-executable architecture. See `THIRD_PARTY_NOTICES.md` for the inspected upstream revision and license attribution.

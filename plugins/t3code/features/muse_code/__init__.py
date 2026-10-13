@@ -31,6 +31,12 @@ def _shared():
 
 
 class MuseCodeProfile(ProviderProfile):
+    slash_namespace = "muse"
+
+    def slash_commands(self, *, cwd="", runtime=None, **_):
+        from .commands import slash_commands
+        return slash_commands(cwd, runtime)
+
     def create_agent_runtime(self, **kwargs):
         from .catalog import settings_for_profile
         from .runtime import MuseRuntime

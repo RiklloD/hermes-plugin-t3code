@@ -38,7 +38,7 @@ SCHEMAS: dict[str, dict] = {
         "name": "t3_delegate",
         "description": (
             "T3 orchestrator: delegate one task to a child agent on ANY provider/model (e.g. Claude plans, Codex "
-            "implements), or to ANOTHER Hermes profile with target.profile (e.g. ask the financial-advisor profile). The child is a real, visible Hermes session that gets ONLY the task text, never this thread's "
+            "implements), or to ANOTHER Hermes profile with target.profile (e.g. ask another profile you have set up). The child is a real, visible Hermes session that gets ONLY the task text, never this thread's "
             "history, so include every fact, path and constraint it needs. Use this instead of delegate_task when the "
             "child needs a different provider or model, or should be a visible, steerable thread. mode='async' (default) "
             "returns a taskId immediately; the result is delivered back to this thread as a new turn when it finishes, "

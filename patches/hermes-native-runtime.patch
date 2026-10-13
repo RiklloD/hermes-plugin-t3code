@@ -101,6 +101,44 @@ index 57b84fac89..26f8cfb7d4 100644
  
  
  __all__ = ["init_agent"]
+diff --git a/agent/agent_init_snapshot.py b/agent/agent_init_snapshot.py
+new file mode 100644
+index 0000000000..f398a20a5b
+--- /dev/null
++++ b/agent/agent_init_snapshot.py
+@@ -0,0 +1,32 @@
++"""Initial primary-route restoration snapshot."""
++
++def snapshot_primary_runtime(agent):
++    # Per-turn restoration snapshot: after a fallback, the next turn restores these so the
++    # preferred model gets a fresh attempt.
++    _cc = agent.context_compressor
++    agent._primary_runtime = {
++        "model": agent.model,
++        "provider": agent.provider,
++        "requested_provider": agent.requested_provider,
++        "base_url": agent.base_url,
++        "api_mode": agent.api_mode,
++        "api_key": getattr(agent, "api_key", ""),
++        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
++        "client_kwargs": dict(agent._client_kwargs),
++        "use_prompt_caching": agent._use_prompt_caching,
++        "use_native_cache_layout": agent._use_native_cache_layout,
++        "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
++        # Engine state _try_activate_fallback() overwrites (getattr: plugin engines may lack them).
++        "compressor_model": getattr(_cc, "model", agent.model),
++        "compressor_base_url": getattr(_cc, "base_url", agent.base_url),
++        "compressor_api_key": getattr(_cc, "api_key", ""),
++        "compressor_provider": getattr(_cc, "provider", agent.provider),
++        "compressor_context_length": _cc.context_length,
++        "compressor_threshold_tokens": _cc.threshold_tokens,
++    }
++    if agent.api_mode == "anthropic_messages":
++        agent._primary_runtime.update({
++            "anthropic_api_key": agent._anthropic_api_key,
++            "anthropic_base_url": agent._anthropic_base_url,
++            "is_anthropic_oauth": agent._is_anthropic_oauth,
++        })
 diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
 index 15cd862855..66af2fd49e 100644
 --- a/agent/agent_runtime_helpers.py
@@ -157,6 +195,32 @@ index 15cd862855..66af2fd49e 100644
  
  
  def _pre_tool_block_message(agent, function_name, function_args, effective_task_id, tool_call_id, middleware_trace):
+diff --git a/agent/agent_runtime_helpers_billing.py b/agent/agent_runtime_helpers_billing.py
+new file mode 100644
+index 0000000000..b05b650f93
+--- /dev/null
++++ b/agent/agent_runtime_helpers_billing.py
+@@ -0,0 +1,20 @@
++"""Durable billing route after a deliberate model switch."""
++
++import logging
++
++logger = logging.getLogger(__name__)
++
++def persist_switch_billing_route(agent) -> None:
++    """Persist the billing route so dashboard Model cards show the post-switch provider."""
++    # _session_db / session_id may be unset (tests, bare agents).
++    session_db = getattr(agent, "_session_db", None)
++    session_id = getattr(agent, "session_id", None)
++    if session_db is None or not session_id:
++        return
++    try:
++        session_db.update_session_billing_route(
++            session_id, provider=agent.provider, base_url=agent.base_url,
++            billing_mode=getattr(agent, "api_mode", None),
++        )
++    except Exception:
++        logger.warning("Failed to persist billing route after model switch", exc_info=True)
 diff --git a/agent/conversation_compression_manual.py b/agent/conversation_compression_manual.py
 index 214a605cb0..032a570c94 100644
 --- a/agent/conversation_compression_manual.py
@@ -186,141 +250,119 @@ index 06117c1c9a..c35d98a873 100644
          _request_interrupt = _ic_codex_method(self, "request_interrupt")
          if _request_interrupt is not None:
              try:
-diff --git a/agent/turn_facade.py b/agent/turn_facade.py
-index 3830058dce..66b1307a63 100644
---- a/agent/turn_facade.py
-+++ b/agent/turn_facade.py
-@@ -44,6 +44,8 @@ class TurnFacadeMixin:
-         from agent.aux_accounting import reset_accounting_context, set_accounting_context
-         from agent.auxiliary_client import scoped_runtime_main
-         from agent.conversation_loop import run_conversation
-+        if getattr(self, "_native_runtime_kind", ""):
-+            from agent.native_runtime import run_conversation
-         from agent.portal_tags import (
-             reset_affinity_scope, reset_conversation_context, set_affinity_scope,
-             set_conversation_context,
-diff --git a/providers/base.py b/providers/base.py
-index 9183cf3074..7a3a8ad6de 100644
---- a/providers/base.py
-+++ b/providers/base.py
-@@ -108,6 +108,9 @@ class ProviderProfile:
-     # other providers (including an unregistered fallback) get ordinary details only.
-     native_reasoning_details_type: str | None = None
- 
-+    # Opt-in whole-agent runtime. The host forwards turns instead of executing model tools.
-+    agent_runtime: str = ""
-+
-     # ── External-process providers (auth_type="external_process") ──
-     # An agent CLI driven over stdio (ACP) rather than an HTTP endpoint. These
-     # describe how to launch it; hermes_cli/auth.py's
-@@ -348,6 +351,10 @@ class ProviderProfile:
-         """
-         return None
- 
-+    def create_agent_runtime(self, **kwargs: Any) -> Any:
-+        """Build a session-owned NativeAgentRuntime; only profiles with agent_runtime opt in."""
-+        raise NotImplementedError(f"{self.name} does not implement an agent runtime")
-+
-     def setup_status(self, **kwargs: Any) -> dict[str, Any] | None:
-         """External-process providers: ``{available, logged_in, plan, detail, login_command}`` from the
-         CLI itself so setup can gate on login. ``None`` = nothing to report beyond executable presence."""
-diff --git a/run_agent.py b/run_agent.py
-index 7d38b2e1fb..e4c8df6838 100644
---- a/run_agent.py
-+++ b/run_agent.py
-@@ -988,8 +988,10 @@ class AIAgent(
-         _quietly(self._close_cached_request_anthropic_client, reason=reason)
- 
-     def _close_codex_session(self) -> None:
--        """Close the Codex app-server session (else the child keeps running); the attribute is cleared BEFORE
-+        """Close native runtime and Codex sessions (else children keep running); attributes are cleared BEFORE
-         close() so a concurrent reader can't grab a half-closed session."""
-+        from agent.native_runtime import close_runtime
-+        close_runtime(self)
-         codex_session = getattr(self, "_codex_session", None)
-         if codex_session is not None:
-             self._codex_session = None
-diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
-index 9615b5a927..d0ad04cc28 100644
---- a/tui_gateway/session_auto_continue.py
-+++ b/tui_gateway/session_auto_continue.py
-@@ -68,6 +68,12 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
-         return None
-     if not marker.get("auto_continue", True):
-         return None  # The mailbox owns recovery and receipt identity for imported turns.
-+    from agent.native_runtime import runtime_profile
-+    if runtime_profile(str(session.get("provider") or "")):
-+        return None  # Native history owns recovery; replay can duplicate already-executed commands.
-+    with _session_db(session) as db:
-+        if db is not None and db.get_session_model_config_value(session_key, "native_agent_runtime"):
-+            return None
-     from agent.initiate_setup_prompt import intro_resends
-     if intro_resends(marker["prompt"], _session_source(session)):
-         clear_turn_marker(home, session_key)  # the desktop intro sends /initiate-setup again itself
-diff --git a/agent/agent_init_snapshot.py b/agent/agent_init_snapshot.py
+diff --git a/agent/native_commands.py b/agent/native_commands.py
 new file mode 100644
-index 0000000000..f398a20a5b
+index 0000000000..b0392b85d5
 --- /dev/null
-+++ b/agent/agent_init_snapshot.py
-@@ -0,0 +1,32 @@
-+"""Initial primary-route restoration snapshot."""
++++ b/agent/native_commands.py
+@@ -0,0 +1,107 @@
++"""Slash commands a native agent runtime brings with it (Claude Code's ``/review``, a Muse skill, an ACP ``/plan``).
 +
-+def snapshot_primary_runtime(agent):
-+    # Per-turn restoration snapshot: after a fallback, the next turn restores these so the
-+    # preferred model gets a fresh attempt.
-+    _cc = agent.context_compressor
-+    agent._primary_runtime = {
-+        "model": agent.model,
-+        "provider": agent.provider,
-+        "requested_provider": agent.requested_provider,
-+        "base_url": agent.base_url,
-+        "api_mode": agent.api_mode,
-+        "api_key": getattr(agent, "api_key", ""),
-+        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
-+        "client_kwargs": dict(agent._client_kwargs),
-+        "use_prompt_caching": agent._use_prompt_caching,
-+        "use_native_cache_layout": agent._use_native_cache_layout,
-+        "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
-+        # Engine state _try_activate_fallback() overwrites (getattr: plugin engines may lack them).
-+        "compressor_model": getattr(_cc, "model", agent.model),
-+        "compressor_base_url": getattr(_cc, "base_url", agent.base_url),
-+        "compressor_api_key": getattr(_cc, "api_key", ""),
-+        "compressor_provider": getattr(_cc, "provider", agent.provider),
-+        "compressor_context_length": _cc.context_length,
-+        "compressor_threshold_tokens": _cc.threshold_tokens,
-+    }
-+    if agent.api_mode == "anthropic_messages":
-+        agent._primary_runtime.update({
-+            "anthropic_api_key": agent._anthropic_api_key,
-+            "anthropic_base_url": agent._anthropic_base_url,
-+            "is_anthropic_oauth": agent._is_anthropic_oauth,
-+        })
-diff --git a/agent/agent_runtime_helpers_billing.py b/agent/agent_runtime_helpers_billing.py
-new file mode 100644
-index 0000000000..b05b650f93
---- /dev/null
-+++ b/agent/agent_runtime_helpers_billing.py
-@@ -0,0 +1,20 @@
-+"""Durable billing route after a deliberate model switch."""
++A provider whose profile owns an agent runtime may implement
++``slash_commands(*, cwd: str, runtime: NativeAgentRuntime | None) -> list[dict]`` returning
++``{"name", "description", "args_hint"?, "kind"?: "command" | "skill"}`` rows: the commands the native CLI
++itself accepts. Hermes lists them in the slash menu of chats on that provider and sends ``/name args`` to the
++native agent as the turn's prompt; the runtime interprets it. A name Hermes already owns keeps its Hermes
++meaning and the native command is offered as ``/<namespace>:<name>`` (always accepted). ``slash_namespace``
++on the profile names that prefix (default: the provider name). Listing must be quick: it runs per keystroke.
++"""
++
++from __future__ import annotations
 +
 +import logging
++from typing import Any, Iterable
 +
 +logger = logging.getLogger(__name__)
 +
-+def persist_switch_billing_route(agent) -> None:
-+    """Persist the billing route so dashboard Model cards show the post-switch provider."""
-+    # _session_db / session_id may be unset (tests, bare agents).
-+    session_db = getattr(agent, "_session_db", None)
-+    session_id = getattr(agent, "session_id", None)
-+    if session_db is None or not session_id:
-+        return
++
++def _profile(provider: str):
++    if not provider:
++        return None
 +    try:
-+        session_db.update_session_billing_route(
-+            session_id, provider=agent.provider, base_url=agent.base_url,
-+            billing_mode=getattr(agent, "api_mode", None),
-+        )
++        from agent.native_runtime import runtime_profile
++        profile = runtime_profile(provider)
 +    except Exception:
-+        logger.warning("Failed to persist billing route after model switch", exc_info=True)
++        return None
++    return profile if profile is not None and callable(getattr(profile, "slash_commands", None)) else None
++
++
++def _hermes_names(reserved: Iterable[str]) -> set[str]:
++    """Names a Hermes surface already answers besides the command registry: plugin and quick commands."""
++    names = {name.lower().lstrip("/") for name in reserved}
++    try:
++        from hermes_cli.plugins import get_plugin_commands
++        names.update(get_plugin_commands() or {})
++    except Exception:
++        pass
++    try:
++        from hermes_cli.config import load_config_readonly
++        names.update((load_config_readonly() or {}).get("quick_commands") or {})
++    except Exception:
++        pass
++    return names
++
++
++def _hermes_owns(name: str, names: set[str]) -> bool:
++    if name in names:
++        return True
++    try:
++        from hermes_cli.commands import resolve_command
++        return resolve_command(name) is not None
++    except Exception:
++        return False
++
++
++def commands(provider: str, *, cwd: str = "", runtime: Any = None, reserved: Iterable[str] = ()) -> list[dict]:
++    """``[{"slash", "name", "description", "args_hint", "kind"}]`` for a chat on ``provider``; ``[]`` when it
++    has none or listing fails. ``slash`` is the token the user types (``/review`` or ``/claude:compact``)."""
++    profile = _profile(provider)
++    if profile is None:
++        return []
++    try:
++        rows = profile.slash_commands(cwd=cwd, runtime=runtime) or []
++    except Exception:
++        logger.debug("native slash commands for %s failed", provider, exc_info=True)
++        return []
++    namespace = str(getattr(profile, "slash_namespace", "") or profile.name)
++    names = _hermes_names(reserved)
++    out, seen = [], set()
++    for row in rows:
++        name = str((row or {}).get("name") or "").strip().lstrip("/")
++        if not name or name.lower() in seen or any(ch.isspace() for ch in name):
++            continue
++        seen.add(name.lower())
++        slash = f"/{namespace}:{name}" if _hermes_owns(name.lower(), names) else f"/{name}"
++        out.append({"slash": slash, "name": name, "namespace": namespace,
++                    "description": " ".join(str(row.get("description") or "").split()) or f"{profile.display_name} command",
++                    "args_hint": str(row.get("args_hint") or "").strip(),
++                    "kind": "skill" if row.get("kind") == "skill" else "command"})
++    return out
++
++
++def resolve(rows: list[dict], typed: str, arg: str = "") -> dict | None:
++    """The ``command.dispatch`` send directive for ``/typed arg`` among ``rows`` (from :func:`commands`), or None."""
++    typed = typed.strip().lstrip("/").lower()
++    for row in rows:
++        if typed in (row["slash"][1:].lower(), f"{row['namespace']}:{row['name']}".lower()):
++            arg = (arg or "").strip()
++            return {"type": "send", "message": f"/{row['name']}" + (f" {arg}" if arg else ""),
++                    "display": f"/{typed}" + (f" {arg}" if arg else "")}
++    return None
++
++
++def completions(rows: list[dict], text: str) -> list[dict]:
++    """``complete.slash`` items (``text`` without the ``/``, like Hermes's own) for the command token ``text``;
++    ``/`` browses all. Name-prefix matches first; ``/<namespace>:`` matches once most of the namespace is typed."""
++    query = text.lstrip("/").lower()
++    prefix, inner = [], []
++    for row in rows:
++        token, bare = row["slash"][1:].lower(), row["name"].lower()
++        typed_namespace = len(query) >= max(2, len(row["namespace"]) - 1) and token.startswith(query)
++        hit = prefix if bare.startswith(query) or typed_namespace else inner if query in bare else None
++        if hit is not None:
++            meta = row["description"] + (f"  {row['args_hint']}" if row["args_hint"] else "")
++            hit.append({"text": row["slash"][1:], "display": row["slash"], "meta": meta[:160], "kind": row["kind"]})
++    return prefix + inner
 diff --git a/agent/native_runtime.py b/agent/native_runtime.py
 new file mode 100644
 index 0000000000..4d049bac0a
@@ -619,150 +661,220 @@ index 0000000000..4d049bac0a
 +    return {"final_response": text, "messages": messages, "completed": not interrupted and not error,
 +            "failed": bool(error), "error": error, "interrupted": interrupted,
 +            "api_calls": int((terminal or {}).get("api_calls") or bool(terminal)), "agent_persisted": True, **usage}
-diff --git a/tests/agent/test_native_runtime.py b/tests/agent/test_native_runtime.py
-new file mode 100644
-index 0000000000..1f7f5eb750
---- /dev/null
-+++ b/tests/agent/test_native_runtime.py
-@@ -0,0 +1,132 @@
-+"""Whole-turn runtime isolation, durable native identity and existing display callbacks."""
-+from dataclasses import dataclass
+diff --git a/agent/turn_facade.py b/agent/turn_facade.py
+index 3830058dce..66b1307a63 100644
+--- a/agent/turn_facade.py
++++ b/agent/turn_facade.py
+@@ -44,6 +44,8 @@ class TurnFacadeMixin:
+         from agent.aux_accounting import reset_accounting_context, set_accounting_context
+         from agent.auxiliary_client import scoped_runtime_main
+         from agent.conversation_loop import run_conversation
++        if getattr(self, "_native_runtime_kind", ""):
++            from agent.native_runtime import run_conversation
+         from agent.portal_tags import (
+             reset_affinity_scope, reset_conversation_context, set_affinity_scope,
+             set_conversation_context,
+diff --git a/providers/base.py b/providers/base.py
+index 9183cf3074..7a3a8ad6de 100644
+--- a/providers/base.py
++++ b/providers/base.py
+@@ -108,6 +108,9 @@ class ProviderProfile:
+     # other providers (including an unregistered fallback) get ordinary details only.
+     native_reasoning_details_type: str | None = None
+ 
++    # Opt-in whole-agent runtime. The host forwards turns instead of executing model tools.
++    agent_runtime: str = ""
 +
-+import pytest
+     # ── External-process providers (auth_type="external_process") ──
+     # An agent CLI driven over stdio (ACP) rather than an HTTP endpoint. These
+     # describe how to launch it; hermes_cli/auth.py's
+@@ -348,6 +351,10 @@ class ProviderProfile:
+         """
+         return None
+ 
++    def create_agent_runtime(self, **kwargs: Any) -> Any:
++        """Build a session-owned NativeAgentRuntime; only profiles with agent_runtime opt in."""
++        raise NotImplementedError(f"{self.name} does not implement an agent runtime")
 +
-+from agent.native_runtime import NativeAgentRuntime, STATE_KEY, _request
-+from providers.base import ProviderProfile
-+from run_agent import AIAgent
-+
-+
-+class Runtime(NativeAgentRuntime):
-+    def __init__(self, **options):
-+        self.options = options
-+        self.inputs, self.responses = [], []
-+        self.closed = self.interrupted = False
-+
-+    def run_turn(self, message, *, model):
-+        self.inputs.append((message, model))
-+        yield {"type": "session", "state": {"session_id": "native-1", "cwd": self.options["cwd"]}}
-+        yield {"type": "text_delta", "text": "answer"}
-+        yield {"type": "assistant", "text": "answer", "tool_calls": []}
-+        yield {"type": "result", "text": "answer", "usage": {"input_tokens": 3, "output_tokens": 2}}
-+
-+    def respond(self, request_id, response):
-+        self.responses.append((request_id, response))
-+
-+    def interrupt(self):
-+        self.interrupted = True
-+
-+    def close(self):
-+        self.closed = True
-+
-+
-+@dataclass
-+class Profile(ProviderProfile):
-+    def create_agent_runtime(self, **kwargs):
-+        return Runtime(**kwargs)
-+
-+
-+@pytest.fixture
-+def native_agent(tmp_path, monkeypatch):
-+    from providers import register_provider
-+    from hermes_state import SessionDB
-+    profile = Profile(name="test-native", agent_runtime="test-native", base_url="process://test-native")
-+    register_provider(profile)
-+    db = SessionDB(db_path=tmp_path / "state.db")
-+    deltas = []
-+    agent = AIAgent(provider=profile.name, model="test-model", api_key="test-native",
-+                    base_url=profile.base_url, cwd=str(tmp_path), session_db=db,
-+                    session_id="test-session", quiet_mode=True, stream_delta_callback=deltas.append)
-+    yield agent, db, deltas
-+    agent.close()
-+    db.close()
-+
-+
-+def test_native_turn_mirror_is_not_replayed_and_identity_is_durable(native_agent):
-+    agent, db, deltas = native_agent
-+    assert agent.tools == [] and agent.client is None
-+    first = agent.run_conversation("first")
-+    runtime = agent._native_runtime
-+    second = agent.run_conversation("second", conversation_history=first["messages"])
-+    assert first["completed"] and second["completed"]
-+    assert runtime.inputs == [("first", "test-model"), ("second", "test-model")]
-+    assert deltas == ["answer", "answer"]
-+    assert [m["role"] for m in db.get_messages(agent.session_id)] == ["user", "assistant", "user", "assistant"]
-+    assert db.get_session_model_config_value(agent.session_id, STATE_KEY)["session_id"] == "native-1"
-+    assert agent._inflight_turn_id is None
-+    agent.interrupt("stop")
-+    assert runtime.interrupted
-+    agent.close()
-+    assert runtime.closed
-+
-+
-+def test_wrong_workspace_is_refused_before_native_execution(native_agent):
-+    agent, db, _ = native_agent
-+    first = agent.run_conversation("first")
-+    runtime = agent._native_runtime
-+    agent.session_cwd += "/different"
-+    result = agent.run_conversation("second", conversation_history=first["messages"])
-+    assert result["failed"] and "different native runtime or workspace" in result["error"]
-+    assert len(runtime.inputs) == 1
-+
-+
-+def test_questions_use_existing_desktop_shape_and_fail_closed(native_agent):
-+    agent, _, _ = native_agent
-+    question = {"type": "request", "kind": "question", "questions": [{"qid": "q0", "question": "Which?", "choices": ["A", "B"]}]}
-+    assert not _request(agent, question)["allowed"]
-+    seen = []
-+    agent.clarify_callback = lambda value: seen.append(value) or {"answers": {"q0": "B"}}
-+    assert _request(agent, question)["answer"]["answers"] == {"q0": "B"}
-+    assert seen == [question["questions"]]
-+    agent.clarify_callback = lambda value: {"answers": {}}
-+    assert not _request(agent, question)["allowed"]
-+    assert not _request(agent, {"kind": "permission", "tool": "Bash", "input": {"command": "echo test"}})["allowed"]
+     def setup_status(self, **kwargs: Any) -> dict[str, Any] | None:
+         """External-process providers: ``{available, logged_in, plan, detail, login_command}`` from the
+         CLI itself so setup can gate on login. ``None`` = nothing to report beyond executable presence."""
+diff --git a/run_agent.py b/run_agent.py
+index 7d38b2e1fb..e4c8df6838 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -988,8 +988,10 @@ class AIAgent(
+         _quietly(self._close_cached_request_anthropic_client, reason=reason)
+ 
+     def _close_codex_session(self) -> None:
+-        """Close the Codex app-server session (else the child keeps running); the attribute is cleared BEFORE
++        """Close native runtime and Codex sessions (else children keep running); attributes are cleared BEFORE
+         close() so a concurrent reader can't grab a half-closed session."""
++        from agent.native_runtime import close_runtime
++        close_runtime(self)
+         codex_session = getattr(self, "_codex_session", None)
+         if codex_session is not None:
+             self._codex_session = None
+diff --git a/tui_gateway/methods_complete.py b/tui_gateway/methods_complete.py
+index 91a4f96eeb..76186e0597 100644
+--- a/tui_gateway/methods_complete.py
++++ b/tui_gateway/methods_complete.py
+@@ -289,9 +289,11 @@ def _(rid, params: dict) -> dict:
+     # Skill/bundle lookups are home- and cwd-keyed: bind the calling session's profile and workspace so
+     # the popup offers the project-local skills ``command.dispatch`` accepts for that session (#114359).
+     # A new-chat draft has no session yet: it names its rail-selected ``profile`` instead (#124651).
+-    with _session_home_scope(_sessions.get(params.get("session_id", "")), cwd=_completion_cwd(params),
+-                             profile=params.get("profile")):
++    session = _sessions.get(params.get("session_id", ""))
++    with _session_home_scope(session, cwd=_completion_cwd(params), profile=params.get("profile")):
+         skill_commands, skill_bundles = dict(get_interactive_skill_commands()), dict(get_skill_bundles())
++        # The chat's native agent (Claude CLI, Muse Code, …) brings its own commands; offered at the token stage.
++        native_rows = _native_slash_rows(params, session) if " " not in text else []
+     completer = SlashCommandCompleter(
+         skill_commands_provider=lambda: skill_commands, skill_bundles_provider=lambda: skill_bundles)
+     # `kind` reaches the TUI as data (from the providers, not sniffed from ⚡/▣ glyphs):
+@@ -322,6 +324,11 @@ def _(rid, params: dict) -> dict:
+         items = _rank_slash_completions(items, usage, origin_of, browsing=text == "/", score_of=score_of)
+     else:
+         items = items[:_SLASH_COMPLETION_LIMIT]
++    if native_rows:
++        from agent.native_commands import completions as native_completions
++        native_items = native_completions(native_rows, text)
++        taken = {item["text"].lower() for item in native_items}  # a native skill wins over a same-named Hermes one
++        items = native_items + [item for item in items if item["text"].lstrip("/").lower() not in taken]
+     text_lower = text.lower()
+     for extra_text, extra_meta in _SLASH_EXTRAS:
+         if extra_text.startswith(text_lower) and not any(item["text"] == extra_text for item in items):
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index c6ad4348ba..49ad6897a0 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -486,6 +486,42 @@ def _catalog_plugin_commands(cat: _Catalog) -> None:
+         cat.commands[key] = {"argument_mode": mode, "desktop": None}
+ 
+ 
++def _native_slash_provider(session) -> str:
++    """The chat's provider: the session's own route, else (a draft) the profile default. Call inside the home scope."""
++    if session:
++        return _live_session_identity(session)[1]
++    return str((_load_cfg().get("model") or {}).get("provider") or "")
 +
 +
-+def test_native_model_switch_keeps_process_and_cross_runtime_requires_new_chat(native_agent):
-+    agent, _, _ = native_agent
-+    agent.run_conversation("first")
-+    runtime = agent._native_runtime
-+    agent.switch_model("other-model", "test-native")
-+    assert agent._native_runtime is runtime and agent.model == "other-model"
-+    with pytest.raises(ValueError, match="new chat"):
-+        agent.switch_model("gpt-test", "openai")
-+    assert agent.provider == "test-native"
++def _native_slash_rows(params: dict, session=None) -> list[dict]:
++    """The native agent's own slash commands (``agent.native_commands``) for the chat ``params`` names.
++    Call inside ``_session_home_scope``; ``[]`` on any failure."""
++    try:
++        agent = session.get("agent") if session else None
++        reserved = [n for n, *_ in _TUI_EXTRA] + [n for n, *_ in _SLASH_EXTRAS]
++        return _tools_mod("agent.native_commands").commands(
++            _native_slash_provider(session), cwd=_completion_cwd(params),
++            runtime=getattr(agent, "_native_runtime", None), reserved=reserved)
++    except Exception:
++        logger.debug("native slash commands unavailable", exc_info=True)
++        return []
 +
 +
-+def test_host_compression_cannot_rewrite_native_history(native_agent):
-+    from agent.conversation_compression_manual import CompressRequest, compress_now
-+    agent, _, _ = native_agent
-+    with pytest.raises(ValueError, match="owns its context"):
-+        compress_now(agent, [], CompressRequest())
++def _catalog_native_commands(cat: _Catalog, params: dict, session) -> None:
++    rows = _native_slash_rows(params, session)
++    if not rows:
++        return
++    profile = _tools_mod("agent.native_runtime").runtime_profile(_native_slash_provider(session))
++    section = f"{getattr(profile, 'display_name', '') or rows[0]['namespace']} commands"
++    for row in rows:
++        if row["slash"].lower() in cat.canon:
++            continue
++        cat.add(row["slash"], row["description"], section)
++        cat.commands[row["slash"]] = {"argument_mode": "text" if row["args_hint"] else None, "desktop": None}
++    # The chat's own agent first: the popup lists categories in this order.
++    cat.cat_map = {section: cat.cat_map.pop(section, []), **cat.cat_map}
 +
 +
-+def test_rewound_mirror_cannot_replay_native_side_effects(native_agent):
-+    agent, _, _ = native_agent
-+    first = agent.run_conversation("first")
-+    runtime = agent._native_runtime
-+    result = agent.run_conversation("regenerate", conversation_history=first["messages"][:1])
-+    assert result["failed"] and "rewound" in result["error"]
-+    assert runtime.inputs == [("first", "test-model")]
+ def _catalog_skills(cat: _Catalog, skills: dict[str, dict]) -> str:
+     """Append skill pairs and fill ``skills`` = ``{key: {usage, origin}}`` (every consumer ranks by them).
+     Returns the one-line notice for skills whose name is a built-in command (no ``/<name>`` entry;
+@@ -514,8 +550,12 @@ def _(rid, params: dict) -> dict:
+     _catalog_registry(cat)
+     warning = ""
+     skills: dict[str, dict] = {}
+-    with _session_home_scope(_sessions.get(params.get("session_id", "")), cwd=_completion_cwd(params),
+-                             profile=params.get("profile")):
++    session = _sessions.get(params.get("session_id", ""))
++    with _session_home_scope(session, cwd=_completion_cwd(params), profile=params.get("profile")):
++        try:
++            _catalog_native_commands(cat, params, session)
++        except Exception as e:
++            warning = f"native command discovery unavailable: {e}"
+         try:
+             _catalog_quick_commands(cat)
+         except Exception as e:
+@@ -677,6 +717,13 @@ def _is_registry_command(base: str) -> bool:
+         return False
+ 
+ 
++def _dispatch_native(rid, params, session, name, arg):
++    """A native agent's own command (``/review``, ``/claude:compact``): send it to that agent as the prompt."""
++    rows = _native_slash_rows(params, session)
++    directive = _tools_mod("agent.native_commands").resolve(rows, name, arg) if rows else None
++    return _ok(rid, directive) if directive else None
 +
 +
-+def test_copied_native_identity_cannot_share_a_process_between_forks(native_agent):
-+    agent, db, _ = native_agent
-+    first = agent.run_conversation("first")
-+    runtime = agent._native_runtime
-+    state = db.get_session_model_config_value(agent.session_id, STATE_KEY)
-+    db.patch_session_model_config(agent.session_id, {STATE_KEY: {**state, "owner": "parent-session"}})
-+    result = agent.run_conversation("fork", conversation_history=first["messages"])
-+    assert result["failed"] and "fork" in result["error"]
-+    assert len(runtime.inputs) == 1
+ def _dispatch_plugin(rid, params, session, name, arg):
+     if handler := _plugin_command_handler(name):
+         with contextlib.suppress(Exception):
+@@ -1095,11 +1142,13 @@ def _(rid, params: dict) -> dict:
+     name, arg = _resolve_name(params.get("name", "").lstrip("/")), params.get("arg", "")
+     session = _sessions.get(params.get("session_id", ""))
+ 
+-    # Stage order is load-bearing: quick > plugin > bundle > skill > built-in. One home binding
+-    # around the whole loop: the routing guard (``_profile_skill_command``) and the stages
++    # Stage order is load-bearing: native > quick > plugin > bundle > skill > built-in (a native name that
++    # Hermes owns is only reachable as ``<namespace>:<name>``, so native never shadows those). One home
++    # binding around the whole loop: the routing guard (``_profile_skill_command``) and the stages
+     # must resolve against the SAME profile or a secondary-only skill is routed here and then
+     # not found (#110695).
+-    stages = (_dispatch_quick, _dispatch_plugin, _dispatch_bundle, _dispatch_skill, _SLASH_BUILTINS.get(name))
++    stages = (_dispatch_native, _dispatch_quick, _dispatch_plugin, _dispatch_bundle, _dispatch_skill,
++              _SLASH_BUILTINS.get(name))
+     with _session_home_scope(session):
+         for stage in filter(None, stages):
+             res = stage(rid, params, session, name, arg)
+@@ -1130,9 +1179,12 @@ def _(rid, params: dict) -> dict:
+     if base in _WORKER_BLOCKED_COMMANDS and _is_snapshot_restore(arg):
+         return _err(rid, 4018, "snapshot restore mutates live config/state; use command.dispatch for /snapshot restore")
+     # Pending-input built-ins route straight to command.dispatch (some clients fail the
+-    # error-then-retry fallback); bundles go the same way under their resolved key.
++    # error-then-retry fallback); bundles go the same way under their resolved key, and so do
++    # the native agent's own commands (sent to it as the prompt).
+     with _session_home_scope(session):  # a secondary-only bundle must route too (#110695)
+         target = base if base in _PENDING_INPUT_COMMANDS else _bundle_key_for(base)
++        if target is None and base and _dispatch_native(rid, params, session, base, arg) is not None:
++            target = base
+     if target is not None:
+         return _methods["command.dispatch"](rid, {"name": target.lstrip("/"), "arg": arg, "session_id": sid})
+     # Recognized skills keep the 4018 gate so clients command.dispatch. A scan
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 9615b5a927..d0ad04cc28 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -68,6 +68,12 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+         return None
+     if not marker.get("auto_continue", True):
+         return None  # The mailbox owns recovery and receipt identity for imported turns.
++    from agent.native_runtime import runtime_profile
++    if runtime_profile(str(session.get("provider") or "")):
++        return None  # Native history owns recovery; replay can duplicate already-executed commands.
++    with _session_db(session) as db:
++        if db is not None and db.get_session_model_config_value(session_key, "native_agent_runtime"):
++            return None
+     from agent.initiate_setup_prompt import intro_resends
+     if intro_resends(marker["prompt"], _session_source(session)):
+         clear_turn_marker(home, session_key)  # the desktop intro sends /initiate-setup again itself
 diff --git a/website/docs/developer-guide/plugins/agent-runtime-plugin.md b/website/docs/developer-guide/plugins/agent-runtime-plugin.md
 new file mode 100644
-index 0000000000..09f388fff9
+index 0000000000..e984c5a8cb
 --- /dev/null
 +++ b/website/docs/developer-guide/plugins/agent-runtime-plugin.md
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,68 @@
 +---
 +title: Native agent runtime plugins
 +---
@@ -822,3 +934,12 @@ index 0000000000..09f388fff9
 +native tasks, and model-only auxiliary requests require a separate provider.
 +Runtime plugins currently require `plugins.isolation: in_process`; there is no
 +cross-plugin-host session transport in this version.
++
++A runtime profile may also expose the native CLI's own slash commands by implementing
++`slash_commands(*, cwd, runtime)`, returning `{name, description, args_hint?, kind?}`
++rows (`kind` is `command` or `skill`; `runtime` is the chat's live runtime or `None`).
++Hermes lists them first in the slash menu of chats on that provider and sends
++`/name args` to the native agent as the turn's prompt; the runtime interprets it. A
++name Hermes already owns keeps its Hermes meaning, and the native command is offered
++as `/<slash_namespace>:<name>` (the profile attribute; default: the provider name).
++The listing runs per keystroke, so it must answer from a cache.

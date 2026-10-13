@@ -1,7 +1,7 @@
 name: t3code
 label: T3 Code
 kind: standalone
-version: 0.3.0
+version: 0.4.0
 description: >-
   T3 Code for Hermes, as one plugin with independent features: Inbox (T3's thread sidebar with
   snooze, settle and crash / usage-limit recovery), Usage (Claude Code, Codex and Z.ai tokens,

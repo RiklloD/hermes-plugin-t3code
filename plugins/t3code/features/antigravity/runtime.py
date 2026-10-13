@@ -12,7 +12,7 @@ from t3code_shared import orchestration
 from t3code_shared.native_turns import TurnRuntime, message_parts
 from t3code_shared.stdio_rpc import RpcError, StdioRpc
 
-from . import catalog, protocol
+from . import catalog, commands, protocol
 
 DEFAULT_MODELS = {"default", "antigravity-default"}
 
@@ -34,6 +34,7 @@ class AntigravityRuntime(TurnRuntime):
         self._turn = None
         self.hermes_session = ""  # the Hermes chat of the latest turn (orchestrator tools, subagents)
         self.mcp = None
+        self.commands = None  # the agent's available_commands_update (Hermes's slash menu)
 
     # ── host ──────────────────────────────────────────────────────────────────────────────────
 
@@ -182,10 +183,17 @@ class AntigravityRuntime(TurnRuntime):
             self.emit({"type": "assistant", "text": text, "reasoning": reasoning, "tool_calls": list(tool_calls)})
 
     def _notification(self, method, params):
-        if method != "session/update" or params.get("sessionId") != self.session_id:
+        if method != "session/update":
             return
         update = params.get("update") or {}
         kind = update.get("sessionUpdate")
+        if kind == "available_commands_update":
+            # Sent right after session/new answers, possibly before session_id is stored.
+            if self.session_id in (None, params.get("sessionId")):
+                self.commands = commands.remember(update.get("availableCommands"))
+            return
+        if params.get("sessionId") != self.session_id:
+            return
         with self._lock:
             turn = self._turn
             if kind in ("config_option_update", "config_options_update") and update.get("configOptions"):

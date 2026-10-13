@@ -25,28 +25,27 @@ Inbox and Usage apply live. For the Orchestrator, the UI and REST apply live, bu
 t3code/
 ├── plugin.yaml              one manifest: feature switches + Claude CLI options (config_schema), tools, hooks
 ├── __init__.py              agent entry → shared/features.register_agent_features
-├── conftest.py              pytest wiring for every test below
 ├── shared/                  the only code features share (keep it small)
 │   ├── features.py          feature table, toggles, status, guarded startup, Claude CLI provider link
 │   ├── hermes_data.py       Hermes root + per-profile state.db (Inbox + Usage)
 │   ├── stdio_rpc.py         newline JSON-RPC over a child's stdio (Muse MSP + Antigravity ACP)
 │   ├── native_turns.py      NativeAgentRuntime turn plumbing for the stdio providers
+│   ├── native_commands.py   the native agents' slash-command cache (Hermes's slash menu)
 │   └── desktop/
 │       ├── shell.js         the Desktop plugin: starts/stops features from the toggles, T3 Code settings page
 │       └── isolation.js     per-feature scoped ctx, error boundaries, guarded callbacks, storage migration
 ├── features/
-│   ├── inbox/               api.py (REST) · desktop.js (UI) · tests/
-│   ├── usage/               api.py · desktop.js · tests/
-│   ├── orchestrator/        agent.py (tools, hook, /t3) · core/ (engine) · api.py · desktop.js · web.js · tests/
-│   ├── claude_cli/          model provider (__init__.py, sdk_runtime.py, …) · tests/
-│   ├── muse_code/           model provider (__init__.py, catalog.py, protocol.py, runtime.py) · tests/
-│   └── antigravity/         model provider (… + release.py runtime install, setup.py install/login) · tests/
+│   ├── inbox/               api.py (REST) · desktop.js (UI)
+│   ├── usage/               api.py · desktop.js
+│   ├── orchestrator/        agent.py (tools, hook, /t3) · core/ (engine) · api.py · desktop.js · web.js
+│   ├── claude_cli/          model provider (__init__.py, sdk_runtime.py, …)
+│   ├── muse_code/           model provider (__init__.py, catalog.py, protocol.py, runtime.py)
+│   └── antigravity/         model provider (… + release.py runtime install, setup.py install/login)
 ├── dashboard/
 │   ├── manifest.json        web dashboard tab + REST mount
 │   ├── plugin_api.py        mounts features/<f>/api.py at /api/plugins/t3code/<f>/ — each isolated
 │   └── dist/index.js        GENERATED from features/orchestrator/web.js
-├── scripts/build.mjs        builds the generated files (Desktop bundle + web tab)
-└── tests/                   cross-feature isolation tests (Python + Desktop)
+└── scripts/build.mjs        builds the generated files (Desktop bundle + web tab)
 ```
 
 The Desktop half is GENERATED into `~/.hermes/desktop-plugins/t3code/plugin.js`, a standalone Desktop plugin that is on by default. It is not shipped as `plugins/t3code/desktop/`, because Hermes installs a package's desktop half switched off until you enable it by hand.
@@ -73,6 +72,21 @@ Hermes Desktop hot-reloads the rebuilt bundle by itself. Python changes need a b
 | `shared/` is broken, or the generated Desktop bundle has a syntax error | All of T3 Code is affected. This is the one shared risk, so keep `shared/` small |
 | A feature hangs the backend process or the renderer thread | Not containable by error handling (same process). That would need process isolation |
 
+## Native slash commands
+
+In a chat on Claude CLI, Muse Code or Antigravity, the slash menu lists that agent's own commands first, and
+picking one sends `/name args` to the agent itself. Names Hermes already uses stay Hermes commands; the
+native one is namespaced: `/claude:compact`, `/muse:goal`, `/agy:plan`.
+
+| Agent | Where the list comes from | How it runs |
+|---|---|---|
+| Claude CLI | Claude Code's initialize response (built-ins, skills, plugin and project commands), per workspace | Claude Code runs the prompt itself |
+| Muse Code | `skill/list` (live session, or a throwaway read-only host) + `/compact`, `/goal`, `/rename` | skills as `skill` input parts; built-ins as MSP methods |
+| Antigravity | the agent's ACP `available_commands_update` (`/plan`, `/logout`) | the agent parses the prompt |
+
+Lists are cached in `plugin-data/t3code/commands.json` and refreshed in the background; a live session's
+own list always wins. The hook needs the `agent/native_commands.py` host seam (Hermes gateway).
+
 ## Data and compatibility
 
 - Data stays where it was: `plugin-data/t3-inbox/lifecycle.json` and `plugin-data/t3-orchestrator/orchestrator.db`.
@@ -83,13 +97,3 @@ Hermes Desktop hot-reloads the rebuilt bundle by itself. Python changes need a b
 
 Feature details: `features/orchestrator/README.md`, `features/usage/README.md`, `features/claude_cli/README.md`.
 
-## Tests
-
-```sh
-# Python (all features + isolation); needs pytest and Hermes's deps (+ claude-agent-sdk for claude_cli)
-HERMES_HOME=$(mktemp -d) <python> -m pytest plugins/t3code -q
-# Desktop
-node plugins/t3code/tests/desktop/isolation.mjs          # cross-feature isolation
-node plugins/t3code/features/inbox/tests/desktop/run.mjs  # Inbox behaviour
-node plugins/t3code/features/usage/tests/desktop/flicker.cjs
-```

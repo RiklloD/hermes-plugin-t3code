@@ -32,6 +32,12 @@ def _shared():
 
 
 class AntigravityProfile(ProviderProfile):
+    slash_namespace = "agy"
+
+    def slash_commands(self, *, cwd="", runtime=None, **_):
+        from .commands import slash_commands
+        return slash_commands(cwd, runtime)
+
     def create_agent_runtime(self, **kwargs):
         from .catalog import settings_for_profile
         from .runtime import AntigravityRuntime

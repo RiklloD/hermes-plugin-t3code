@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import threading
 
-from t3code_shared import orchestration
+from t3code_shared import native_commands, orchestration
 from t3code_shared.native_turns import TurnRuntime, message_parts
 from t3code_shared.stdio_rpc import RpcError, StdioRpc, uuid7
 
-from . import catalog, protocol
+from . import catalog, commands, protocol
 
 def save_usage(usage):
     """Keep the last subscription window for the Usage page; Muse itself keeps none on disk."""
@@ -44,6 +44,7 @@ class MuseRuntime(TurnRuntime):
         self.rpc = None
         self.session_id = self.state.get("session_id")
         self.session_model = None
+        self.skills = None  # skill/list rows (Hermes's slash menu), refetched after skill/changed
         self._lock = threading.RLock()  # serialises reader-thread notifications with turn state
         self._turn = None
         self.hermes_session = ""  # the Hermes chat of the latest turn (orchestrator tools, subagents)
@@ -126,12 +127,18 @@ class MuseRuntime(TurnRuntime):
         if target and target != self.session_model:
             self._command("session/setModel", {"model": {"modelId": target, "providerId": "meta"}})
             self.session_model = target
+        if (command := commands.parse(text)) is not None:
+            name, args = command
+            if name in commands.BUILTIN_NAMES:
+                return self._builtin(name, args)
+            if (selector := self._skill_selector(name)) is not None:
+                # Muse resolves and expands its own skill; the images ride along.
+                parts = [{"type": "skill", "selector": selector, **({"arguments": args} if args else {})}, *parts[1:]]
         effort = protocol.resolve_effort(catalog.cached_row(self.session_model or ""),
                                          str(self.settings.get("reasoning_effort") or ""))
         turn_id = uuid7()
         with self._lock:
-            self._turn = {"id": turn_id, "joined": set(), "items": {}, "tools": set(), "done": set(),
-                          "streamed": set(), "asked": set(), "usage": {}, "interrupt": False}
+            self._turn = self._new_turn(turn_id)
         try:
             result = self.rpc.request("turn/start", {
                 "sessionId": self.session_id, "input": parts, "displayText": text or "Image attachment",
@@ -144,6 +151,63 @@ class MuseRuntime(TurnRuntime):
             raise
         if (result or {}).get("turnId") != turn_id:
             raise RuntimeError("Muse admitted the turn under an unexpected identity")
+
+    @staticmethod
+    def _new_turn(turn_id):
+        return {"id": turn_id, "joined": set(), "items": {}, "tools": set(), "done": set(),
+                "streamed": set(), "asked": set(), "usage": {}, "interrupt": False}
+
+    # ── Muse's own slash commands (Hermes's slash menu → features/muse_code/commands.py) ──────
+
+    def _skill_selector(self, name):
+        if self.skills is None:
+            try:
+                entries = (self.rpc.request("skill/list", {"sessionId": self.session_id}, 15) or {}).get("skills")
+                self.skills = commands.skill_rows(entries)
+                native_commands.put(commands.PROVIDER, self.cwd, self.skills)
+            except Exception:
+                return None
+        return next((row["name"] for row in self.skills if row["name"].lower() == name.lower()), None)
+
+    def _builtin(self, name, args):
+        def reply(text):
+            # Muse answered (even "no"): a rejected command is a reply, not a failed turn.
+            self.end({"text": text, "usage": {}, "api_calls": 0, "interrupted": False, "error": None})
+
+        try:
+            if name == "compact":
+                result = self._command("session/compact", {}) or {}
+                return reply("Muse is compacting this conversation." if result.get("status") != "noop"
+                             else f"Nothing to compact ({result.get('reason') or 'noop'}).")
+            if name == "rename":
+                if not args:
+                    return reply("Usage: /rename <name>")
+                result = self._command("session/rename", {"name": args}) or {}
+                return reply(f"Muse session renamed to {result.get('name') or args}.")
+            verb = args.lower() if args.lower() in ("clear", "pause", "resume") else "set"
+            if verb == "set" and not args:
+                return reply("Usage: /goal <objective> | clear | pause | resume")
+            # Setting or resuming a goal can wake a Muse turn: own it from its first event and stream it.
+            with self._lock:
+                self._turn = self._new_turn(None)
+            try:
+                result = self._command(f"goal/{verb}", {"objective": args} if verb == "set" else {}) or {}
+            except Exception:
+                with self._lock:
+                    self._turn = None
+                raise
+            with self._lock:
+                if result.get("turnId"):
+                    self._turn["id"] = result["turnId"]
+                    self._turn["joined"].discard(result["turnId"])
+                    return None
+                self._turn = None
+            return reply({"set": "Goal set.", "clear": "Goal cleared.", "pause": "Goal paused.",
+                          "resume": "Goal resumed."}[verb])
+        except Exception as exc:
+            reason = str(exc).rsplit("rejected: ", 1)[-1]
+            return reply(f"/{name}: " + {"missing_run": "nothing to compact yet",
+                                         "missing_goal": "no goal is set"}.get(reason, reason))
 
     def interrupt_turn(self):
         turn = self._turn
@@ -170,6 +234,9 @@ class MuseRuntime(TurnRuntime):
     def _notification(self, method, params):
         if method == "usage/changed":
             return save_usage(params)
+        if method == "skill/changed":
+            self.skills = None
+            return
         try:
             with self._lock:
                 self._handle(method, params)
