@@ -5,7 +5,8 @@
  * scripts/build.mjs — edit this file, then rebuild.
  *
  * A port of T3 Code's usage interface (apps/web/src/components/usage/UsagePage.tsx).
- * Mounted in the existing Command Center → Usage tab. No extra access button.
+ * Mounted in the existing Command Center → Usage tab; a titlebar button left of
+ * the Settings gear opens it directly.
  *
  * Data comes from this feature's backend (features/usage/api.py, under /api/plugins/t3code/usage):
  *   GET /usage?days=N  Claude Code + Codex tokens and API-equivalent cost, by
@@ -19,7 +20,7 @@ import React from 'react'
 
 const {
   host, atom, useValue, useQuery, queryClient, cn, Button, Tip,
-  ROUTES_AREA, PALETTE_AREA, STATUSBAR_AREAS
+  ROUTES_AREA, PALETTE_AREA, STATUSBAR_AREAS, TITLEBAR_AREAS
 } = sdk
 
 const h = React.createElement
@@ -1082,6 +1083,34 @@ export default {
         area: ROUTES_AREA,
         data: { path: ROUTE },
         render: () => h(UsagePage, null)
+      },
+      {
+        // Titlebar shortcut left of the Settings gear (T3 Code's usage button spot).
+        // Rendered INSIDE the right cluster via its slot, not `titleBar.tools.right`:
+        // the pane header only reserves window-drag-free space for that measured
+        // cluster, so a separate tools cluster sits on a drag region and eats clicks.
+        // `order: -1` moves it before the gear in the cluster's flex row.
+        id: 'titlebar',
+        area: (TITLEBAR_AREAS && TITLEBAR_AREAS.right) || 'titleBar.right',
+        render: () =>
+          h(
+            Tip,
+            { label: 'Usage', placement: 'toolbar' },
+            h(
+              Button,
+              {
+                'aria-label': 'Usage',
+                className: 'bg-transparent select-none text-muted-foreground/85 hover:bg-(--ui-control-hover-background) hover:text-foreground',
+                onClick: () => host.navigate(CC_USAGE),
+                onPointerDown: e => e.stopPropagation(),
+                size: 'icon-titlebar',
+                style: { order: -1 },
+                type: 'button',
+                variant: 'ghost'
+              },
+              h('i', { 'aria-hidden': true, className: 'codicon codicon-graph leading-none', style: { fontSize: '13.9px' } })
+            )
+          )
       },
       {
         id: 'open',
