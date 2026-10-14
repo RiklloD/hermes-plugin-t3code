@@ -2400,7 +2400,9 @@ const CardRow = memo(function CardRow({ row, section, drag, dragging, dropBefore
           h(
             'div',
             { className: 't3i-line1' },
-            hasDraft ? h(DraftMark) : null,
+            // Like T3 Code: the open chat shows its own composer, so the pen
+            // only marks rows you have navigated away from.
+            hasDraft && !row.isActive ? h(DraftMark) : null,
             h(ProfileMark, { profile: s.profile }),
             h('span', { className: 't3i-proj' }, s.profile || 'default'),
             s.handoff_platform || (s.source && !['tui', 'desktop', 'cli', 'api'].includes(s.source))
@@ -3842,7 +3844,14 @@ function InboxPane() {
     )
   } else {
     // New-chat drafts lead the list, split from the rest by a rule (like T3).
-    const draftList = Object.entries(drafts).sort((a, b) => b[1].at - a[1].at)
+    // The chat being typed into right now gets NO row — a fresh typing session
+    // was never left, so there is nothing to surface back to the user (T3 Code
+    // hides never-left drafts the same way). The row appears the moment the
+    // draft is left: the fresh key rotates to another new chat, or a session
+    // takes focus. Text keeps syncing underneath either way.
+    const draftList = Object.entries(drafts)
+      .filter(([k]) => !(freshKey === k && !focusedId))
+      .sort((a, b) => b[1].at - a[1].at)
 
     draftList.forEach(([k, d]) =>
       items.push(h(DraftRow, { active: freshKey === k && !focusedId, draft: d, draftKey: k, key: `draft:${k}`, now }))
