@@ -752,7 +752,11 @@ function recordEdges(owner, prev, next) {
     const wasBusy = BUSY.has(was) || (prev.background[id] || 0) > 0;
     const isBusy = BUSY.has(is) || (next.background[id] || 0) > 0;
     if (wasBusy && !isBusy || is === "waiting" && was !== "waiting") {
-      patches[rowKeyForLive(owner, id)] = { returnedAt: now };
+      const row = cachedRows().find((s) => ownerOf(s) === owner && sessionIds(s).includes(id));
+      patches[rowKeyForLive(owner, id)] = {
+        returnedAt: now,
+        ...row && isFocused({ s: row }) ? { visitedAt: now } : {}
+      };
     } else if (!wasBusy && was !== "waiting" && BUSY.has(is)) {
       patches[rowKeyForLive(owner, id)] = { sentAt: now };
     }
@@ -1083,6 +1087,8 @@ function deriveRow(s, cx) {
   const outcomeAt = s.outcome_at ? s.outcome_at * 1e3 : null;
   const sentAt = Math.max(s.sent_at ? s.sent_at * 1e3 : 0, rec.sentAt || 0) || null;
   const visitedAt = rec.visitedAt || 0;
+  const completedAt = Math.max(outcomeAt || 0, rec.returnedAt || 0) || (s.unread ? lastActive : 0);
+  const unseenCompletion = completedAt > visitedAt && Boolean(s.unread || visitedAt || rec.returnedAt);
   const pinPos = ids.map((id) => pinOrder.get(id)).find((v) => v !== void 0);
   const isPinned = pinnedFlag(s, key, pinPos, now);
   const live_ = busy || waiting || background;
@@ -1112,7 +1118,7 @@ function deriveRow(s, cx) {
   const isSnoozed = Boolean(snoozeUntil) && snoozeUntil > now && wokeAt === null;
   const isWoke = wokeAt !== null && visitedAt < wokeAt && !isSettled;
   const isActive = focusedId !== null && ids.includes(focusedId);
-  const status = waiting ? pendingKind === "approval" ? "approval" : "input" : busy ? "working" : background ? "background" : freshFailure && !isActive ? outcome : isWoke ? "woke" : s.unread && !isActive ? "done" : null;
+  const status = waiting ? pendingKind === "approval" ? "approval" : "input" : busy ? "working" : background ? "background" : freshFailure && !isActive ? outcome : isWoke ? "woke" : unseenCompletion && !isActive ? "done" : null;
   const attentionAt = Math.max(outcomeAt || 0, rec.returnedAt || 0, rec.unsettledAt || 0, isWoke ? wokeAt : 0, waitingSince || 0) || lastActive;
   return {
     attentionAt,
@@ -1484,7 +1490,6 @@ function WorkingTimer({ since }) {
 var OUTCOME_MARKS = {
   failed: { className: "t3i-c-err", icon: "x", title: "Last turn failed" },
   limited: { className: "t3i-c-warn", icon: "gauge", title: "Last turn hit a usage limit" },
-  ok: { className: "t3i-c-ok", icon: "check", title: "Done" },
   stopped: { className: "t3i-dim", icon: "square", title: "Stopped" }
 };
 function OutcomeMark({ row }) {
