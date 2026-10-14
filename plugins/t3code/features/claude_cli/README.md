@@ -22,6 +22,12 @@ For a versioned model with native 1M context, the regular picker row uses its fu
 
 After updating the Python feature, restart the Hermes backend to load it; the generated desktop half hot-reloads independently. No account credentials, global Claude settings or unrelated profile configurations are changed by a context selection.
 
+## Background updates
+
+Native Monitor events, background commands and subagent follow-up replies continue streaming after the initial answer. You do not need to send “ok” or another message to receive each update. They use the existing Hermes turn, tool and permission UI and are saved in the display history; the bridge does not send a synthetic follow-up prompt to Claude.
+
+Stop holds automatic delivery until your next message. Replies already produced by Claude remain queued rather than being discarded. Updating this Python bridge requires a backend restart; it does not change an already-running Claude process.
+
 ## Settings
 
 Hermes stores these under `plugins.entries.t3code.settings` as `claude_*` keys (declared in t3code's `plugin.yaml`, so they appear on its settings page). The pre-merge `plugins.entries.claude-cli.settings` is still read as a fallback:

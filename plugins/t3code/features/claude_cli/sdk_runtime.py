@@ -44,7 +44,12 @@ class ClaudeRuntime(NativeAgentRuntime):
         self.cwd, self.state, self.settings = cwd, state, settings
         self.environment = environment
         self._commands = queue.Queue()
-        self._events = queue.Queue()
+        from .background import BackgroundMailbox
+        self._background = BackgroundMailbox(self)
+        self._route_events = None
+        self._foreground_done = None
+        self._native_idle = None
+        self._reader_task = None
         self._ready = threading.Event()
         self._busy = threading.Lock()
         self._closed = False
@@ -60,6 +65,7 @@ class ClaudeRuntime(NativeAgentRuntime):
         self._thread = threading.Thread(target=lambda: context.run(self._thread_main),
                                         name="claude-cli-runtime", daemon=True)
         self._thread.start()
+        self._background.start()
 
     def _thread_main(self):
         try:
@@ -98,57 +104,103 @@ class ClaudeRuntime(NativeAgentRuntime):
                 self.commands = remember(self.settings, self.cwd, await client.get_server_info())
             except Exception:
                 pass  # the slash menu falls back to the cached list
+            self._native_idle = asyncio.Event()
+            self._native_idle.set()
+            self._reader_task = asyncio.create_task(self._read_messages(client, state))
             self._ready.set()
-            while True:
-                command = await asyncio.to_thread(self._commands.get)
-                if command is None:
-                    break
-                message, model, events = command
-                self._active_events = events
-                try:
-                    selected_policy = context_policy(model, self.settings)
-                    if selected_policy != policy:
-                        # Environment-backed context caps require a new process, not a new conversation.
-                        # Exit/re-enter on the owning task so AnyIO's cancellation scopes stay ordered.
-                        self._client = None
-                        await stack.aclose()
-                        updated = native_options(self.settings, self.environment, self.cwd, state, model=model)
-                        updated.can_use_tool, updated.hooks = options.can_use_tool, options.hooks
-                        updated.mcp_servers = options.mcp_servers
-                        client = await stack.enter_async_context(ClaudeSDKClient(updated))
-                        self._client = client
-                        policy = selected_policy
-                        active_model = updated.model
-                    selected_model = launch_model(model, policy)
-                    if selected_model != active_model:
-                        await client.set_model(selected_model)
-                        active_model = selected_model
-                    projector = Projector(self.cwd, str(self.settings.get("config_directory") or ""))
-                    await client.query(_prompt(message))
-                    if self._interrupt_pending.is_set():
-                        await client.interrupt()
-                    async for native_message in client.receive_response():
-                        # Result carries session_id too: resumed turns need not repeat the init event.
-                        native_id = getattr(native_message, "session_id", None)
-                        if native_id:
-                            state.update(session_id=native_id,
-                                         config_directory=str(self.settings.get("config_directory") or ""))
-                        for event in projector.project(native_message):
-                            if event["type"] == "session":
-                                state.update(event["state"])
-                                state.pop("fork_from", None)
-                                state.pop("fork_at", None)
-                            events.put(event)
-                except Exception as exc:
-                    events.put({"type": "worker_error", "error": str(exc)})
-                    # A malformed stream has no safe next-turn boundary; retire this process.
-                    break
-                finally:
-                    self._interrupt_pending.clear()
-                    self._pending.clear()
-                    events.put(None)
-                    self._active_events = None
-            self._client = None
+            try:
+                while True:
+                    command = await asyncio.to_thread(self._commands.get)
+                    if command is None:
+                        break
+                    message, model, events = command
+                    self._active_events = events
+                    try:
+                        # User input can win host admission while a native wake is pending.
+                        while (prior := self._background.take()) is not None:
+                            events.put({"type": "prior_turn", "events": prior.events})
+                            await self._native_idle.wait()
+                        if self._worker_error:
+                            raise RuntimeError(str(self._worker_error))
+                        selected_policy = context_policy(model, self.settings)
+                        if selected_policy != policy:
+                            self._reader_task.cancel()
+                            await asyncio.gather(self._reader_task, return_exceptions=True)
+                            self._client = None
+                            await stack.aclose()
+                            updated = native_options(self.settings, self.environment, self.cwd, state, model=model)
+                            updated.can_use_tool, updated.hooks = options.can_use_tool, options.hooks
+                            updated.mcp_servers = options.mcp_servers
+                            client = await stack.enter_async_context(ClaudeSDKClient(updated))
+                            self._client = client
+                            policy, active_model = selected_policy, updated.model
+                            self._reader_task = asyncio.create_task(self._read_messages(client, state))
+                        selected_model = launch_model(model, policy)
+                        if selected_model != active_model:
+                            await client.set_model(selected_model)
+                            active_model = selected_model
+                        self._foreground_done = self._loop.create_future()
+                        self._route_events = events
+                        self._native_idle.clear()
+                        await client.query(_prompt(message))
+                        if self._interrupt_pending.is_set():
+                            await client.interrupt()
+                        await self._foreground_done
+                    except Exception as exc:
+                        events.put({"type": "worker_error", "error": str(exc)})
+                        break
+                    finally:
+                        self._interrupt_pending.clear()
+                        events.put(None)
+                        self._active_events = None
+            finally:
+                self._reader_task.cancel()
+                await asyncio.gather(self._reader_task, return_exceptions=True)
+                self._client = None
+
+    def _route(self, event):
+        if self._route_events is None:
+            self._route_events = self._background.create()
+            self._native_idle.clear()
+        self._route_events.put(event)
+
+    async def _read_messages(self, client, state):
+        # One reader per process, even while Hermes is idle. receive_response() strands
+        # native monitor/subagent/background replies after the first terminal result.
+        projector = Projector(self.cwd, str(self.settings.get("config_directory") or ""))
+        try:
+            async for message in client.receive_messages():
+                native_id = getattr(message, "session_id", None)
+                if native_id:
+                    state.update(session_id=native_id, config_directory=projector.config_directory)
+                for event in projector.project(message):
+                    if event["type"] == "session":
+                        state.update(event["state"])
+                        state.pop("fork_from", None)
+                        state.pop("fork_at", None)
+                    self._route(event)
+                    if event["type"] == "result":
+                        origin = getattr(message, "origin", None) or {}
+                        foreground = self._route_events is self._active_events and self._active_events is not None
+                        if foreground and origin.get("kind") == "task-notification":
+                            continue
+                        if foreground:
+                            self._foreground_done.set_result(None)
+                        else:
+                            self._route_events.put(None)
+                        self._route_events = None
+                        self._native_idle.set()
+            raise RuntimeError("Claude Code stream ended")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._worker_error = exc
+            self._route({"type": "worker_error", "error": str(exc)})
+            self._route_events.put(None)
+            self._native_idle.set()
+            if self._foreground_done is not None and not self._foreground_done.done():
+                self._foreground_done.set_exception(exc)
+            self._commands.put(None)
 
     async def _permission(self, name, inputs, _context):
         from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
@@ -163,7 +215,7 @@ class ClaudeRuntime(NativeAgentRuntime):
             event["questions"] = [{"qid": f"q{i}", "question": q["question"],
                 "choices": [o["label"] for o in q.get("options", [])], "multi_select": bool(q.get("multiSelect"))}
                 for i, q in enumerate(inputs.get("questions", []))]
-        self._active_events.put(event)
+        self._route(event)
         try:
             response = await future
         finally:
@@ -184,28 +236,39 @@ class ClaudeRuntime(NativeAgentRuntime):
         if not self._busy.acquire(blocking=False):
             raise RuntimeError("This Claude conversation already has an active turn")
         try:
+            self._interrupt_pending.clear()
             if not self._ready.wait(45):
                 raise TimeoutError("Claude Code initialization did not finish within 45 seconds")
             if self._worker_error:
                 raise RuntimeError(f"Claude Code initialization failed: {self._worker_error}")
             if not self._thread.is_alive():
                 raise RuntimeError("Claude Code worker exited; resume the conversation explicitly")
-            events = queue.Queue()
-            self._commands.put((message, model, events))
-            while True:
-                try:
-                    event = events.get(timeout=1)
-                except queue.Empty:
-                    if not self._thread.is_alive():
-                        raise RuntimeError("Claude Code worker exited without finishing the turn")
-                    continue
-                if event is None:
-                    break
-                if event["type"] == "worker_error":
-                    raise RuntimeError(event["error"])
-                yield event
+            background = self._background.take(message) if isinstance(message, str) else None
+            if background is not None:
+                events = background.events
+            else:
+                events = queue.Queue()
+                self._commands.put((message, model, events))
+            yield from self._consume(events)
         finally:
             self._busy.release()
+
+    def _consume(self, events):
+        while True:
+            try:
+                event = events.get(timeout=1)
+            except queue.Empty:
+                if not self._thread.is_alive():
+                    raise RuntimeError("Claude Code worker exited without finishing the turn")
+                continue
+            if event is None:
+                return
+            if event["type"] == "worker_error":
+                raise RuntimeError(event["error"])
+            if event["type"] == "prior_turn":
+                yield from self._consume(event["events"])
+            else:
+                yield event
 
     def respond(self, request_id, response):
         def complete():
@@ -230,6 +293,7 @@ class ClaudeRuntime(NativeAgentRuntime):
         if self._closed:
             return
         self._closed = True
+        self._background.close()
         self.interrupt()
         self._commands.put(None)
         self._thread.join(timeout=8)
