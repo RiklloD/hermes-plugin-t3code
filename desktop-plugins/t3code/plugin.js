@@ -749,11 +749,11 @@ function recordEdges(owner, prev, next) {
   for (const id of ids) {
     const was = prev.statuses[id];
     const is = next.statuses[id];
-    const wasBusy = was === "working" || was === "starting" || (prev.background[id] || 0) > 0;
-    const isBusy = is === "working" || is === "starting" || (next.background[id] || 0) > 0;
+    const wasBusy = BUSY.has(was) || (prev.background[id] || 0) > 0;
+    const isBusy = BUSY.has(is) || (next.background[id] || 0) > 0;
     if (wasBusy && !isBusy || is === "waiting" && was !== "waiting") {
       patches[rowKeyForLive(owner, id)] = { returnedAt: now };
-    } else if (!wasBusy && was !== "waiting" && (is === "working" || is === "starting")) {
+    } else if (!wasBusy && was !== "waiting" && BUSY.has(is)) {
       patches[rowKeyForLive(owner, id)] = { sentAt: now };
     }
   }
@@ -852,7 +852,7 @@ async function pollOwner(owner, request) {
   }
   const changed = !prev || prev.stale || !sameMap(prev.statuses, statuses) || !sameMap(prev.background, background) || !sameMap(prev.pending, pending);
   if (changed) {
-    if (prev && Object.keys(prev.statuses).some((k) => (prev.statuses[k] === "working" || prev.statuses[k] === "starting") && statuses[k] !== prev.statuses[k])) {
+    if (prev && Object.keys(prev.statuses).some((k) => BUSY.has(prev.statuses[k]) && statuses[k] !== prev.statuses[k])) {
       refresh();
     }
     setOwnerLive(owner, next);
@@ -1055,7 +1055,7 @@ async function runRecovery() {
   }
 }
 var isFailure = (outcome) => outcome === "failed" || outcome === "limited";
-var BUSY = /* @__PURE__ */ new Set(["working", "starting"]);
+var BUSY = /* @__PURE__ */ new Set(["working"]);
 function deriveRow(s, cx) {
   const { life, live: live2, prefs, now, focusedId, pinOrder } = cx;
   const key = keyOf(s);
@@ -1824,7 +1824,9 @@ var CardRow = memo(function CardRow2({ row, section, drag, dragging, dropBefore,
           h(
             "div",
             { className: "t3i-line1" },
-            hasDraft ? h(DraftMark) : null,
+            // Like T3 Code: the open chat shows its own composer, so the pen
+            // only marks rows you have navigated away from.
+            hasDraft && !row.isActive ? h(DraftMark) : null,
             h(ProfileMark, { profile: s.profile }),
             h("span", { className: "t3i-proj" }, s.profile || "default"),
             s.handoff_platform || s.source && !["tui", "desktop", "cli", "api"].includes(s.source) ? h("span", { className: "t3i-src" }, s.handoff_platform || s.source) : null,
@@ -2980,7 +2982,7 @@ function InboxPane() {
       )
     );
   } else {
-    const draftList = Object.entries(drafts).sort((a, b) => b[1].at - a[1].at);
+    const draftList = Object.entries(drafts).filter(([k]) => !(freshKey === k && !focusedId)).sort((a, b) => b[1].at - a[1].at);
     draftList.forEach(
       ([k, d]) => items.push(h(DraftRow, { active: freshKey === k && !focusedId, draft: d, draftKey: k, key: `draft:${k}`, now }))
     );

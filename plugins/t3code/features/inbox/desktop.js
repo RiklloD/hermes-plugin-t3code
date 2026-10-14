@@ -991,12 +991,12 @@ function recordEdges(owner, prev, next) {
   for (const id of ids) {
     const was = prev.statuses[id]
     const is = next.statuses[id]
-    const wasBusy = was === 'working' || was === 'starting' || (prev.background[id] || 0) > 0
-    const isBusy = is === 'working' || is === 'starting' || (next.background[id] || 0) > 0
+    const wasBusy = BUSY.has(was) || (prev.background[id] || 0) > 0
+    const isBusy = BUSY.has(is) || (next.background[id] || 0) > 0
 
     if ((wasBusy && !isBusy) || (is === 'waiting' && was !== 'waiting')) {
       patches[rowKeyForLive(owner, id)] = { returnedAt: now }
-    } else if (!wasBusy && was !== 'waiting' && (is === 'working' || is === 'starting')) {
+    } else if (!wasBusy && was !== 'waiting' && BUSY.has(is)) {
       patches[rowKeyForLive(owner, id)] = { sentAt: now }
     }
   }
@@ -1133,7 +1133,7 @@ async function pollOwner(owner, request) {
   if (changed) {
     // A row that just stopped working has new content: refetch so the
     // outcome, unread and activity land without waiting for the poll.
-    if (prev && Object.keys(prev.statuses).some(k => (prev.statuses[k] === 'working' || prev.statuses[k] === 'starting') && statuses[k] !== prev.statuses[k])) {
+    if (prev && Object.keys(prev.statuses).some(k => BUSY.has(prev.statuses[k]) && statuses[k] !== prev.statuses[k])) {
       refresh()
     }
 
@@ -1419,7 +1419,9 @@ async function runRecovery() {
 
 // ─── classification (T3's section rules on Hermes data) ─────────────────────
 const isFailure = outcome => outcome === 'failed' || outcome === 'limited'
-const BUSY = new Set(['working', 'starting'])
+// Hermes also reports 'starting' for read-only resume/prewarm. Only an actual
+// turn is work: opening a thread must not fake a send, completion or shelf move.
+const BUSY = new Set(['working'])
 
 function deriveRow(s, cx) {
   const { life, live, prefs, now, focusedId, pinOrder } = cx
