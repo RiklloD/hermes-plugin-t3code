@@ -19,6 +19,9 @@
  *   - search: titles and metadata locally, transcript text through Hermes'
  *     full-text index, ↑/↓ + Enter without leaving the input
  *   - context menu, double-click rename, middle-click opens in a new tab
+ *   - drag a row (or the whole selection) onto the chat composer to mention
+ *     the thread there (`@session:` chip); typing @ in the composer also
+ *     offers threads from the roster
  *
  * Recovery: threads cut off by a crash resume on launch, and usage-limited
  * threads resume as soon as the limit lifts (see "recovery" below).
@@ -71,7 +74,8 @@ const {
   Tip,
   ToggleRow,
   ListRow,
-  SegmentedControl
+  SegmentedControl,
+  COMPOSER_AREAS
 } = sdk
 
 const h = React.createElement
@@ -2783,6 +2787,170 @@ function useDrag(groupsRef) {
   return { api: api_, state, zone }
 }
 
+// ─── thread mentions: drag a thread onto the composer, or pick it from @ ────
+// A mention is core's `@session:<profile>/<durable id>` chip: the composer
+// hydrates the token on insert, the transcript renders it with the thread's
+// title, and the agent resolves it with session_search.
+const COMPOSER_ROOT_SELECTOR = '[data-slot="composer-root"]'
+const threadRef = s => `@session:${profileOf(s)}/${durableOf(s)}`
+
+function threadMentionItems(query) {
+  const q = String(query || '').trim().toLowerCase()
+  const out = []
+
+  for (const s of cachedRows()) {
+    const title = rowTitle(s)
+
+    if (
+      q &&
+      !title.toLowerCase().includes(q) &&
+      !profileOf(s).toLowerCase().includes(q) &&
+      !durableOf(s).toLowerCase().includes(q)
+    ) {
+      continue
+    }
+
+    out.push({
+      display: title,
+      insert: threadRef(s),
+      meta: `Thread · ${profileOf(s)}${s.message_count ? ` · ${plural(s.message_count, 'message')}` : ''}`
+    })
+
+    if (out.length >= 10) {
+      break
+    }
+  }
+
+  return out
+}
+
+function sessionsForDragKeys(keys) {
+  const byKeyMap = new Map(cachedRows().map(s => [keyOf(s), s]))
+
+  return keys.map(k => byKeyMap.get(k)).filter(Boolean)
+}
+
+/** Insert `@session:` mentions for `sessions` into a composer. `sessionId`
+ * addresses that session's composer; null = the active one. */
+async function mentionSessions(sessions, sessionId = null) {
+  const refs = [...new Set(sessions.filter(Boolean).map(threadRef))]
+
+  if (!refs.length) {
+    return false
+  }
+
+  if (typeof host.composer?.insertText !== 'function') {
+    host.notify({ kind: 'error', message: 'Could not mention the thread: this Hermes build has no composer insert.', title: 'Inbox' })
+
+    return false
+  }
+
+  const ok = await host.composer.insertText(sessionId, refs.join(' '), { mode: 'inline' })
+
+  if (!ok) {
+    host.notify({ kind: 'error', message: 'Could not mention the thread: no composer is showing for that chat.', title: 'Inbox' })
+  }
+
+  return ok
+}
+
+/** The session a composer belongs to, from the chat surface hosting it
+ * (`tile:<stored id>`); null for the primary/active composer. */
+function composerSessionIdFor(root) {
+  const target = root?.closest?.('[data-composer-target]')?.dataset?.composerTarget || ''
+
+  return target.startsWith('tile:') ? target.slice('tile:'.length) || null : null
+}
+
+/**
+ * Let an Inbox drag land on the chat composer. Rows already ride native DnD
+ * with DRAG_MIME (for shelf reordering); shelf targets stopPropagation, so a
+ * document-level listener only sees drags that leave the pane. Only a drop
+ * whose target is inside a composer root is claimed — everything else keeps
+ * its existing meaning.
+ */
+function installComposerThreadDrop(ctx) {
+  let highlighted = null
+  let savedOutline = null
+
+  const clearHighlight = () => {
+    if (highlighted) {
+      highlighted.style.outline = savedOutline.outline
+      highlighted.style.outlineOffset = savedOutline.outlineOffset
+      highlighted = null
+      savedOutline = null
+    }
+  }
+
+  const highlight = root => {
+    if (highlighted === root) {
+      return
+    }
+
+    clearHighlight()
+    highlighted = root
+    savedOutline = { outline: root.style.outline, outlineOffset: root.style.outlineOffset }
+    root.style.outline = '2px solid var(--ui-accent)'
+    root.style.outlineOffset = '-2px'
+  }
+
+  const accepts = e => Array.from(e.dataTransfer?.types || []).includes(DRAG_MIME)
+  const rootFor = e => e.target?.closest?.(COMPOSER_ROOT_SELECTOR) || null
+
+  ctx.addEventListener(document, 'dragover', e => {
+    if (!accepts(e)) {
+      return
+    }
+
+    const root = rootFor(e)
+
+    if (!root) {
+      clearHighlight()
+
+      return
+    }
+
+    e.preventDefault()
+    // Rows set effectAllowed='move'; a mismatched dropEffect suppresses the drop.
+    e.dataTransfer.dropEffect = 'move'
+    highlight(root)
+  })
+
+  ctx.addEventListener(document, 'dragleave', e => {
+    if (highlighted && e.target === highlighted && !highlighted.contains(e.relatedTarget)) {
+      clearHighlight()
+    }
+  })
+
+  ctx.addEventListener(document, 'dragend', clearHighlight)
+
+  ctx.addEventListener(document, 'drop', e => {
+    if (!accepts(e)) {
+      return
+    }
+
+    const root = rootFor(e)
+
+    clearHighlight()
+
+    if (!root) {
+      return
+    }
+
+    e.preventDefault()
+    e.stopPropagation()
+    const sessions = sessionsForDragKeys(readDragKeys(e))
+
+    if (!sessions.length) {
+      host.notify({ kind: 'warning', message: 'That thread is no longer in the Inbox list.', title: 'Inbox' })
+
+      return
+    }
+
+    void mentionSessions(sessions, composerSessionIdFor(root))
+  })
+}
+
 // ─── drafts ─────────────────────────────────────────────────────────────────
 // Unsent text typed into a new chat, kept like an email draft. Core already
 // stashes it under a per-chat `__new__:<uuid>` key, but starting another new
@@ -4131,6 +4299,15 @@ export default {
         dock: { pane: 'sessions', pos: 'center' }
       },
       render: () => h(InboxPane, null)
+    })
+
+    // Mention a thread without leaving the chat: drop an Inbox row on the
+    // composer, or type @ and pick the thread from the completion popover.
+    installComposerThreadDrop(ctx)
+    ctx.register({
+      area: COMPOSER_AREAS?.atCompletions || 'composer.atCompletions',
+      data: { provide: query => threadMentionItems(query) },
+      id: 'thread-mentions'
     })
 
     const focusedRow = () => {

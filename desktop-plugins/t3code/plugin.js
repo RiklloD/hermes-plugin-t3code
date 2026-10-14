@@ -43,7 +43,8 @@ var {
   Tip,
   ToggleRow,
   ListRow,
-  SegmentedControl
+  SegmentedControl,
+  COMPOSER_AREAS
 } = sdk;
 var h = React.createElement;
 var { memo, useCallback, useEffect, useMemo, useRef, useState } = React;
@@ -2140,6 +2141,111 @@ function useDrag(groupsRef) {
   });
   return { api: api_, state, zone };
 }
+var COMPOSER_ROOT_SELECTOR = '[data-slot="composer-root"]';
+var threadRef = (s) => `@session:${profileOf(s)}/${durableOf(s)}`;
+function threadMentionItems(query) {
+  const q = String(query || "").trim().toLowerCase();
+  const out = [];
+  for (const s of cachedRows()) {
+    const title = rowTitle(s);
+    if (q && !title.toLowerCase().includes(q) && !profileOf(s).toLowerCase().includes(q) && !durableOf(s).toLowerCase().includes(q)) {
+      continue;
+    }
+    out.push({
+      display: title,
+      insert: threadRef(s),
+      meta: `Thread \xB7 ${profileOf(s)}${s.message_count ? ` \xB7 ${plural(s.message_count, "message")}` : ""}`
+    });
+    if (out.length >= 10) {
+      break;
+    }
+  }
+  return out;
+}
+function sessionsForDragKeys(keys) {
+  const byKeyMap = new Map(cachedRows().map((s) => [keyOf(s), s]));
+  return keys.map((k) => byKeyMap.get(k)).filter(Boolean);
+}
+async function mentionSessions(sessions, sessionId = null) {
+  const refs = [...new Set(sessions.filter(Boolean).map(threadRef))];
+  if (!refs.length) {
+    return false;
+  }
+  if (typeof host.composer?.insertText !== "function") {
+    host.notify({ kind: "error", message: "Could not mention the thread: this Hermes build has no composer insert.", title: "Inbox" });
+    return false;
+  }
+  const ok = await host.composer.insertText(sessionId, refs.join(" "), { mode: "inline" });
+  if (!ok) {
+    host.notify({ kind: "error", message: "Could not mention the thread: no composer is showing for that chat.", title: "Inbox" });
+  }
+  return ok;
+}
+function composerSessionIdFor(root) {
+  const target = root?.closest?.("[data-composer-target]")?.dataset?.composerTarget || "";
+  return target.startsWith("tile:") ? target.slice("tile:".length) || null : null;
+}
+function installComposerThreadDrop(ctx) {
+  let highlighted = null;
+  let savedOutline = null;
+  const clearHighlight = () => {
+    if (highlighted) {
+      highlighted.style.outline = savedOutline.outline;
+      highlighted.style.outlineOffset = savedOutline.outlineOffset;
+      highlighted = null;
+      savedOutline = null;
+    }
+  };
+  const highlight = (root) => {
+    if (highlighted === root) {
+      return;
+    }
+    clearHighlight();
+    highlighted = root;
+    savedOutline = { outline: root.style.outline, outlineOffset: root.style.outlineOffset };
+    root.style.outline = "2px solid var(--ui-accent)";
+    root.style.outlineOffset = "-2px";
+  };
+  const accepts = (e) => Array.from(e.dataTransfer?.types || []).includes(DRAG_MIME);
+  const rootFor = (e) => e.target?.closest?.(COMPOSER_ROOT_SELECTOR) || null;
+  ctx.addEventListener(document, "dragover", (e) => {
+    if (!accepts(e)) {
+      return;
+    }
+    const root = rootFor(e);
+    if (!root) {
+      clearHighlight();
+      return;
+    }
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    highlight(root);
+  });
+  ctx.addEventListener(document, "dragleave", (e) => {
+    if (highlighted && e.target === highlighted && !highlighted.contains(e.relatedTarget)) {
+      clearHighlight();
+    }
+  });
+  ctx.addEventListener(document, "dragend", clearHighlight);
+  ctx.addEventListener(document, "drop", (e) => {
+    if (!accepts(e)) {
+      return;
+    }
+    const root = rootFor(e);
+    clearHighlight();
+    if (!root) {
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    const sessions = sessionsForDragKeys(readDragKeys(e));
+    if (!sessions.length) {
+      host.notify({ kind: "warning", message: "That thread is no longer in the Inbox list.", title: "Inbox" });
+      return;
+    }
+    void mentionSessions(sessions, composerSessionIdFor(root));
+  });
+}
 var CORE_DRAFTS_KEY = "hermes:composer-drafts:v3";
 var CORE_FRESH_KEY = "hermes.desktop.freshDraftKey";
 var DRAFT_SYNC_EVENT = "hermes:composer-draft-sync";
@@ -3253,6 +3359,12 @@ var desktop_default = {
       },
       render: () => h(InboxPane, null)
     });
+    installComposerThreadDrop(ctx);
+    ctx.register({
+      area: COMPOSER_AREAS?.atCompletions || "composer.atCompletions",
+      data: { provide: (query) => threadMentionItems(query) },
+      id: "thread-mentions"
+    });
     const focusedRow = () => {
       const id = host.state.focusedStoredSessionId.get();
       return id ? groupsForCommands().rows.find((r) => isFocused(r)) || null : null;
@@ -3353,7 +3465,7 @@ function groupsForCommands() {
 // features/orchestrator/desktop.js
 import * as sdk2 from "@hermes/plugin-sdk";
 import React2 from "react";
-var { host: host2, atom: atom2, useValue: useValue2, useQuery: useQuery2, queryClient: queryClient2, Tip: Tip2, SESSION_ROW_AREAS, COMPOSER_AREAS } = sdk2;
+var { host: host2, atom: atom2, useValue: useValue2, useQuery: useQuery2, queryClient: queryClient2, Tip: Tip2, SESSION_ROW_AREAS, COMPOSER_AREAS: COMPOSER_AREAS2 } = sdk2;
 var h2 = React2.createElement;
 var { useState: useState2 } = React2;
 var NS2 = "t3code.orchestrator";
@@ -3740,7 +3852,7 @@ var desktop_default2 = {
         invalidate();
       });
     }
-    const top = COMPOSER_AREAS?.top || "composer.top";
+    const top = COMPOSER_AREAS2?.top || "composer.top";
     ctx.register({ area: top, id: "context-strip", order: 50, render: () => h2(ContextStrip, null) });
     if (SESSION_ROW_AREAS?.trailing) {
       ctx.register({ area: SESSION_ROW_AREAS.trailing, data: { render: ({ sessionId }) => h2(RowBadge, { sessionId }) }, id: "row-badge" });

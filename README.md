@@ -12,6 +12,13 @@ T3 Code's features for [Hermes Agent](https://github.com/NousResearch/hermes-age
 | **Antigravity** | Google's official Antigravity ACP agent as the “Antigravity” model provider |
 | **Native slash commands** | Each native agent's own commands (`/claude:compact`, `/muse:goal`, `/agy:plan`) in Hermes's slash menu |
 
+## Latest changes
+
+- **Inbox thread mentions:** drag one thread or a selection onto a chat composer to insert `@session:` mentions, or type `@` to search the Inbox roster. Drops target the composer they land on, including tiled chats. The prebuilt Desktop bundle includes this feature.
+- **Muse staged approvals:** each requirement gets its own permission prompt and exact decision payload; duplicate notifications are suppressed and stale answers are ignored after interruption, stage advancement, completion, or turn replacement. No stages are automatically approved. This adapter fix does not repair existing Muse approval-replay failures or rewrite session history.
+
+Backend changes require a Hermes backend restart; Desktop changes hot-reload.
+
 ## Install
 
 **Installing with an AI agent?** Point it at [INSTALL.md](INSTALL.md) — it is written for agents, with ordered steps, checks and stop conditions. Humans: continue below.

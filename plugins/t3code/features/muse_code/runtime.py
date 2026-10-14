@@ -6,6 +6,8 @@ mirror. The session id is minted here (UUIDv7) and resumed with ``session/resume
 
 from __future__ import annotations
 
+import copy
+import json
 import threading
 
 from t3code_shared import native_commands, orchestration
@@ -155,7 +157,7 @@ class MuseRuntime(TurnRuntime):
     @staticmethod
     def _new_turn(turn_id):
         return {"id": turn_id, "joined": set(), "items": {}, "tools": set(), "done": set(),
-                "streamed": set(), "asked": set(), "usage": {}, "interrupt": False}
+                "streamed": set(), "asked": set(), "approval_current": {}, "usage": {}, "interrupt": False}
 
     # ── Muse's own slash commands (Hermes's slash menu → features/muse_code/commands.py) ──────
 
@@ -285,7 +287,7 @@ class MuseRuntime(TurnRuntime):
                 self.emit({"type": "reasoning_delta", "text": delta})
             elif field in ("output", "visibleOutput"):
                 item["visibleOutput"] = (item.get("visibleOutput") or "") + delta
-        elif method == "approval/requested" or (method == "approval/updated" and params.get("approvalId") in turn["asked"]):
+        elif method in ("approval/requested", "approval/updated"):
             self._approval(turn, params)
         elif method == "userInput/requested":
             self._question(turn, params)
@@ -390,26 +392,47 @@ class MuseRuntime(TurnRuntime):
 
     def _approval(self, turn, approval):
         approval_id = approval.get("approvalId")
-        if not approval_id or approval_id in turn["asked"] or not self._owns(turn, approval.get("turnId")) \
+        if not approval_id or turn["interrupt"] or not self._owns(turn, approval.get("turnId")) \
                 and approval.get("subagentOrigin") is None:
             return
-        turn["asked"].add(approval_id)
+        if approval.get("status") in ("approved", "denied", "aborted", "cancelled", "completed"):
+            turn["approval_current"].pop(approval_id, None)
+            return
         choices = protocol.approval_choices(approval)
+        if not choices:
+            return
+        # Muse advances requirements under one approval ID; dedupe stages, not the action.
+        approval = copy.deepcopy(approval)
+        choices = protocol.approval_choices(approval)
+        requirement = json.dumps(approval.get("currentRequirementId"), sort_keys=True)
+        key = ("approval", approval_id, requirement)
+        if key in turn["asked"]:
+            return
+        turn["asked"].add(key)
+        turn["approval_current"][approval_id] = key
         subject = approval.get("subject") or {}
 
         def decide(response):
+            with self._lock:
+                if self._turn is not turn or turn["interrupt"] or \
+                        turn["approval_current"].get(approval_id) != key:
+                    return
             choice = choices.get("accept" if response.get("allowed") else "decline")
             if choice is None:
                 return
-            threading.Thread(target=self._send_decision, args=(approval, choice), daemon=True).start()
+            threading.Thread(target=self._send_decision, args=(approval, choice, turn, key), daemon=True).start()
 
-        self.ask(f"approval:{approval_id}", {
+        self.ask(f"approval:{approval_id}:{requirement}", {
             "kind": "permission", "tool": approval.get("toolName") or subject.get("kind") or "tool",
             "input": {"request": protocol.approval_prompt(approval),
                       **{k: v for k, v in subject.items() if k in ("kind", "access", "command", "path", "host", "target")}}},
             decide)
 
-    def _send_decision(self, approval, choice):
+    def _send_decision(self, approval, choice, turn, key):
+        with self._lock:
+            if self._turn is not turn or turn["interrupt"] or \
+                    turn["approval_current"].get(approval["approvalId"]) != key:
+                return
         try:
             self._command("approval/decide", {"approvalId": approval["approvalId"],
                                                "requirementId": approval.get("currentRequirementId"),
