@@ -227,6 +227,11 @@ class ClaudeRuntime(NativeAgentRuntime):
                 native_id = getattr(message, "session_id", None)
                 if native_id:
                     state.update(session_id=native_id, config_directory=projector.config_directory)
+                if getattr(message, "subtype", None) == "compact_boundary" and state.get("session_id"):
+                    # Hermes's context meter counts the CLI's compactions; persisted with the native state.
+                    state["compactions"] = int(state.get("compactions") or 0) + 1
+                    self._route({"type": "session", "state": {"session_id": state["session_id"],
+                                                              "compactions": state["compactions"]}})
                 for event in projector.project(message):
                     if event["type"] == "session":
                         state.update(event["state"])
@@ -362,6 +367,14 @@ class ClaudeRuntime(NativeAgentRuntime):
         except Exception:
             logging.getLogger("t3code.claude").debug("steer failed", exc_info=True)
             return False
+
+    def context_usage(self):
+        """Claude Code's own /context reading for Hermes's context meter; None until connected."""
+        client, loop = self._client, self._loop
+        if self._closed or client is None or loop is None or not loop.is_running():
+            return None
+        from .projection import context_snapshot
+        return context_snapshot(asyncio.run_coroutine_threadsafe(client.get_context_usage(), loop).result(timeout=8))
 
     def respond(self, request_id, response):
         def complete():

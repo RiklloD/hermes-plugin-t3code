@@ -221,6 +221,48 @@ index 0000000000..b05b650f93
 +        )
 +    except Exception:
 +        logger.warning("Failed to persist billing route after model switch", exc_info=True)
+diff --git a/agent/context_breakdown.py b/agent/context_breakdown.py
+index 6d9fedec6c..6499d8ce2e 100644
+--- a/agent/context_breakdown.py
++++ b/agent/context_breakdown.py
+@@ -209,6 +209,37 @@ def compute_session_context_breakdown(agent: Any, messages: Optional[list[dict]]
+     }
+ 
+ 
++def native_context_breakdown(agent: Any) -> Optional[dict[str, Any]]:
++    """The breakdown for a native-runtime chat, from the CLI's own reading: Hermes's prompt, tools and
++    transcript are not what the CLI sends, so estimating them would describe a context that does not
++    exist. None until the CLI has reported once."""
++    from agent.native_runtime import native_context
++    ctx = native_context(agent, refresh=True)
++    context_max = int(ctx.get("context_max") or 0)
++    if not context_max:
++        return None
++    categories = []
++    for row in ctx.get("categories") or []:
++        category_id, tokens = str(row.get("id") or ""), int(row.get("tokens") or 0)
++        if not category_id or tokens <= 0:
++            continue
++        known = category_id in _CATEGORIES
++        categories.append({"id": category_id, "tokens": tokens,
++                           "label": _category_label(category_id) if known else str(row.get("label") or category_id),
++                           "color": (_CATEGORIES[category_id] if known else _CATEGORIES["system_prompt"])[0]})
++    context_used = min(int(ctx.get("context_used") or 0), context_max)
++    return {
++        "categories": categories,
++        "context_max": context_max,
++        "context_percent": max(0, min(100, round(context_used / context_max * 100))),
++        "context_used": context_used,
++        "context_source": "provider_usage",
++        "context_estimated": False,
++        "estimated_total": sum(c["tokens"] for c in categories),
++        "model": str(ctx.get("model") or getattr(agent, "model", "") or ""),
++    }
++
++
+ def compute_context_details(agent: Any) -> dict[str, Any]:
+     """Expanded per-skill / per-toolset cost listing for ``/context all``.
+ 
 diff --git a/agent/conversation_compression_manual.py b/agent/conversation_compression_manual.py
 index 214a605cb0..032a570c94 100644
 --- a/agent/conversation_compression_manual.py
@@ -290,10 +332,10 @@ index 06117c1c9a..a3d24da2f8 100644
          if _native_steer is not None:
 diff --git a/agent/native_commands.py b/agent/native_commands.py
 new file mode 100644
-index 0000000000..b0392b85d5
+index 0000000000..514b91a2ae
 --- /dev/null
 +++ b/agent/native_commands.py
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,121 @@
 +"""Slash commands a native agent runtime brings with it (Claude Code's ``/review``, a Muse skill, an ACP ``/plan``).
 +
 +A provider whose profile owns an agent runtime may implement
@@ -311,6 +353,11 @@ index 0000000000..b0392b85d5
 +from typing import Any, Iterable
 +
 +logger = logging.getLogger(__name__)
++
++# Hermes's registry answers both spellings with its own compression (/compress, alias /compact).
++# Only this pair may claim its bare token on a native-runtime chat — nothing else Hermes owns
++# is unrunnable there (model/status/help have working live-session forms).
++_COMPRESSION_ALIASES = {"compact", "compress"}
 +
 +
 +def _profile(provider: str):
@@ -378,10 +425,19 @@ index 0000000000..b0392b85d5
 +
 +
 +def resolve(rows: list[dict], typed: str, arg: str = "") -> dict | None:
-+    """The ``command.dispatch`` send directive for ``/typed arg`` among ``rows`` (from :func:`commands`), or None."""
++    """The ``command.dispatch`` send directive for ``/typed arg`` among ``rows`` (from :func:`commands`), or None.
++
++    The compression alias pair also claims its bare spelling: a native-runtime chat has no Hermes
++    agent, so Hermes's own ``/compress`` (alias ``/compact``) can never run there — bare ``/compact``
++    must reach the CLI instead of falling through the registry to a dead Hermes compression run.
++    Every other Hermes-owned name keeps its Hermes meaning bare.
++    """
 +    typed = typed.strip().lstrip("/").lower()
 +    for row in rows:
-+        if typed in (row["slash"][1:].lower(), f"{row['namespace']}:{row['name']}".lower()):
++        name = row["name"].lower()
++        claims_bare = typed in (row["slash"][1:].lower(), f"{row['namespace']}:{row['name']}".lower()) or (
++            name in _COMPRESSION_ALIASES and typed in _COMPRESSION_ALIASES)
++        if claims_bare:
 +            arg = (arg or "").strip()
 +            return {"type": "send", "message": f"/{row['name']}" + (f" {arg}" if arg else ""),
 +                    "display": f"/{typed}" + (f" {arg}" if arg else "")}
@@ -403,10 +459,10 @@ index 0000000000..b0392b85d5
 +    return prefix + inner
 diff --git a/agent/native_runtime.py b/agent/native_runtime.py
 new file mode 100644
-index 0000000000..1a1ad054e6
+index 0000000000..d5b042b3ab
 --- /dev/null
 +++ b/agent/native_runtime.py
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,339 @@
 +"""Host boundary for plugin-owned agent loops. Native history is never replayed from the mirror."""
 +
 +from __future__ import annotations
@@ -420,6 +476,7 @@ index 0000000000..1a1ad054e6
 +
 +logger = logging.getLogger(__name__)
 +STATE_KEY = "native_agent_runtime"
++CONTEXT_KEY = "native_context_usage"
 +
 +
 +class NativeAgentRuntime(ABC):
@@ -445,6 +502,11 @@ index 0000000000..1a1ad054e6
 +        """Deliver user text into the live turn without interrupting it. False when unsupported or idle."""
 +        return False
 +
++    def context_usage(self) -> dict[str, Any] | None:
++        """The CLI's own context reading (its ``/context``): ``{"context_used", "context_max", "model"?,
++        "categories": [{"id", "label", "tokens"}]}``. None when the runtime cannot tell."""
++        return None
++
 +
 +def runtime_profile(provider: str):
 +    from providers import get_provider_profile
@@ -462,6 +524,43 @@ index 0000000000..1a1ad054e6
 +    agent._native_runtime = None
 +    if runtime is not None:
 +        runtime.close()
++
++
++def native_context(agent: Any, *, refresh: bool = False) -> dict:
++    """What the context meter shows for a native chat: the CLI's own occupancy plus its compaction count
++    (``compactions`` in the native state, which the runtime reports through a ``session`` event).
++    ``refresh`` asks the live runtime; the last reading is kept in the session row under its own key
++    (never through ``_bind``, which a concurrent turn may be writing) so a restarted backend, or a chat
++    whose CLI is not running, still shows it."""
++    db = getattr(agent, "_session_db", None)
++    snap = None
++    runtime = getattr(agent, "_native_runtime", None)
++    if refresh and runtime is not None and callable(getattr(runtime, "context_usage", None)):
++        try:
++            snap = runtime.context_usage()
++        except Exception:
++            logger.debug("native context usage unavailable", exc_info=True)
++        if isinstance(snap, dict) and snap.get("context_max"):
++            agent._native_context = snap
++            if db:
++                db.patch_session_model_config(agent.session_id, {CONTEXT_KEY: snap})
++    if not (isinstance(snap, dict) and snap.get("context_max")):
++        snap = getattr(agent, "_native_context", None)
++        if not isinstance(snap, dict) and db:
++            snap = db.get_session_model_config_value(agent.session_id, CONTEXT_KEY)
++    return {**(snap if isinstance(snap, dict) else {}), "compactions": int(_state(agent).get("compactions") or 0)}
++
++
++def native_usage_fields(agent: Any) -> dict[str, Any]:
++    """``session.usage`` context fields for a native chat (no CLI round trip: the last kept reading)."""
++    ctx = native_context(agent)
++    out: dict[str, Any] = {"compressions": ctx["compactions"]}
++    used, maximum = int(ctx.get("context_used") or 0), int(ctx.get("context_max") or 0)
++    if used and maximum:
++        used = min(used, maximum)
++        out.update(context_used=used, context_max=maximum, context_percent=max(0, min(100, round(used / maximum * 100))),
++                   context_source="provider_usage", context_estimated=False)
++    return out
 +
 +
 +def _state(agent: Any) -> dict:
@@ -787,6 +886,62 @@ index 91a4f96eeb..76186e0597 100644
      text_lower = text.lower()
      for extra_text, extra_meta in _SLASH_EXTRAS:
          if extra_text.startswith(text_lower) and not any(item["text"] == extra_text for item in items):
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 60f99535a6..1cacd1ac8a 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -1495,6 +1495,12 @@ def _(rid, params: dict, session: dict) -> dict:
+             "context_estimated": usage.get("context_estimated", False),
+             "context_source": usage.get("context_source", "provider_usage"),
+             "model": _metadata_mirror(session).get("model", "")})
++    from agent.native_runtime import owns_agent_loop
++    if owns_agent_loop(agent):  # the CLI owns its context: report its own reading, not a Hermes estimate
++        from agent.context_breakdown import native_context_breakdown
++        with _session_profile_runtime_scope(session):
++            if (payload := native_context_breakdown(agent)) is not None:
++                return _ok(rid, payload)
+     with session["history_lock"]:
+         history = list(session.get("history", []))
+     # Bind the session context (on the RPC thread the session cwd is unset, so the prompt build inside
+@@ -2140,6 +2146,28 @@ def _compress_live(rid, sid: str, session: dict, focus_topic: str) -> dict:
+         _status_update(sid, "ready")
+ 
+ 
++def _compress_via_native_cli(rid, params: dict, session: dict) -> dict:
++    """``session.compress`` for a native-runtime chat: the CLI owns its context (Claude Code, Muse,
++    Antigravity), so Hermes manual compression can never run there — send the CLI's own ``/compact``
++    as the turn prompt instead. The desktop calls this RPC directly for /compact (slash.ts's compress
++    surface, #44456), bypassing command.dispatch's native stage, so the claim happens here. The
++    desktop already renders a pending compress, and the runtime's compaction boundary lands as a
++    status line (claude projection's compact_boundary, Muse's ``compaction`` item)."""
++    from agent.native_commands import resolve
++    rows = _native_slash_rows(params, session)
++    directive = resolve(rows, "compact") if rows else None
++    if directive is None:
++        return _err(rid, 5005, "This runtime owns its context and its CLI exposes no compact command to "
++                               "forward; Hermes manual compression is unavailable. Native automatic "
++                               "compaction remains active.")
++    submitted = _methods["prompt.submit"](rid, {"session_id": str(params.get("session_id") or ""),
++                                                "text": directive["message"], "queued": True})
++    if "error" in submitted:
++        return submitted
++    return _ok(rid, {"status": "pending",
++                     "message": "the CLI is compacting its own context; the transcript will refresh when it finishes"})
++
++
+ @method("session.compress")
+ @_profile_scoped
+ def _(rid, params: dict) -> dict:
+@@ -2152,6 +2180,9 @@ def _(rid, params: dict) -> dict:
+     if err:
+         return err
+     sid = params.get("session_id", "")
++    from agent.native_runtime import owns_agent_loop
++    if owns_agent_loop(session.get("agent")):
++        return _compress_via_native_cli(rid, params, session)
+     try:
+         with _manual_compress_turn(sid, session):
+             return _compress_live(rid, sid, session, _str_param(params, "focus_topic"))
 diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
 index c6ad4348ba..49ad6897a0 100644
 --- a/tui_gateway/methods_tools.py
@@ -985,3 +1140,18 @@ index 0000000000..e984c5a8cb
 +name Hermes already owns keeps its Hermes meaning, and the native command is offered
 +as `/<slash_namespace>:<name>` (the profile attribute; default: the provider name).
 +The listing runs per keystroke, so it must answer from a cache.
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 849d42b..b9cc92a 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -2209,6 +2209,10 @@ def _get_usage(agent) -> dict:
+         from agent.context_breakdown import context_usage_fields
+         usage.update(context_usage_fields(comp))
+         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
++    with contextlib.suppress(Exception):  # a native CLI owns its context: its occupancy and compaction count win
++        from agent.native_runtime import native_usage_fields, owns_agent_loop
++        if owns_agent_loop(agent):
++            usage.update(native_usage_fields(agent))
+     # Cache-hit ratio + rolling latency/tps (CLI status-bar parity). Omitted, not fabricated, when there is no
+     # data (Codex reports no latency; zero cache reads shows no hit% rather than an alarming 0).
+     with contextlib.suppress(Exception):

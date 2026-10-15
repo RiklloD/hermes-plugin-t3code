@@ -28,6 +28,29 @@ def _clock(epoch) -> str:
         return "unknown time"
 
 
+# Claude Code's /context categories as Hermes context-meter rows. Only ``kind: used`` occupies the
+# window: deferred tools, the autocompact buffer and free space do not.
+_CONTEXT_IDS = {"system prompt": "system_prompt", "system tools": "tool_definitions", "mcp tools": "mcp",
+                "custom agents": "subagent_definitions", "memory files": "rules", "skills": "skills",
+                "messages": "conversation"}
+
+
+def context_snapshot(raw) -> dict | None:
+    """``get_context_usage()`` as the host's ``context_usage()`` reading; None when it reports no window."""
+    maximum = int((raw or {}).get("rawMaxTokens") or (raw or {}).get("maxTokens") or 0)
+    if not maximum:
+        return None
+    rows = {}
+    for cat in raw.get("categories") or []:
+        name = str(cat.get("name") or "").strip()
+        if not name or cat.get("isDeferred") or cat.get("kind", "used") != "used" or not cat.get("tokens"):
+            continue
+        cid = _CONTEXT_IDS.get(name.lower(), name.lower().replace(" ", "_"))
+        rows.setdefault(cid, {"id": cid, "label": name, "tokens": 0})["tokens"] += int(cat["tokens"])
+    return {"context_used": int(raw.get("totalTokens") or 0), "context_max": maximum,
+            "model": raw.get("model") or "", "categories": list(rows.values())}
+
+
 def injected_origin(message) -> str | None:
     """Origin kind of a turn the CLI started on its own (task notification, peer, ...); None for ours."""
     origin = getattr(message, "origin", None)

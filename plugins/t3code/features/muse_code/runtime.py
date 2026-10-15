@@ -382,6 +382,10 @@ class MuseRuntime(TurnRuntime):
             if status != "running" and item_id not in turn["done"]:
                 turn["done"].add(item_id)
                 self.emit({"type": "status", "text": "Muse compacted its context."})
+                # Hermes's context meter counts the CLI's compactions; persisted with the native state.
+                self.state["compactions"] = int(self.state.get("compactions") or 0) + 1
+                self.emit({"type": "session", "state": {"session_id": self.session_id,
+                                                        "compactions": self.state["compactions"]}})
         elif protocol.is_tool(item):
             name, inputs = protocol.tool_name(item), protocol.tool_input(item)
             if item_id not in turn["tools"]:
