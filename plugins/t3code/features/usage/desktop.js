@@ -443,12 +443,12 @@ function LimitsView({ data, error, loading }) {
 
       return h(
         'section',
-        { className: 't3u-limit-card', key: p.provider },
+        { className: 't3u-limit-card', key: p.account_id || p.provider },
         h(
           'div',
           { className: 't3u-limit-head' },
           h(ProviderMark, { provider: p.provider }),
-          h('h2', null, title),
+          h('h2', null, p.account_label ? `${title} · ${p.account_label}` : title),
           p.account ? h('span', { className: 't3u-muted t3u-trunc' }, p.account) : null
         ),
         p.observedAt ? h('p', { className: 't3u-muted', style: { margin: 0 } }, `As of ${new Date(p.observedAt).toLocaleString(undefined, { day: 'numeric', hour: 'numeric', minute: '2-digit', month: 'short' })} (reported during Muse Code turns)`) : null,
@@ -641,6 +641,14 @@ function UsagePage({ grafted = false }) {
               ),
               via.hermes
                 ? h('small', { className: 't3u-muted' }, `${fmtTokens(via.hermes)} via Hermes · ${fmtTokens(via.cli || 0)} via the CLI`)
+                : null,
+              p.accounts && p.accounts.length > 0
+                ? h('div', { className: 't3u-muted', style: { display: 'flex', gap: 16, marginTop: 2 } },
+                    p.accounts.map(acc =>
+                      h('span', { key: acc.id },
+                        `${acc.label}: `,
+                        h('b', { style: { fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-secondary)' } },
+                          fmt(metric === 'cost' ? acc.cost : acc.tokens)))))
                 : null
             )
           })
@@ -910,13 +918,21 @@ const GRAFT_CSS = `[data-t3u-active] > :not([data-t3u-host]){display:none !impor
 // ─── Command Center graft ───────────────────────────────────────────────────
 // Command Center → Usage is open: hash route /command-center with ?section=usage
 // and the overlay nav carrying the usage row. The SDK has no slot inside the
-// overlay, so the page renders in a permanent (hidden) status-bar mount and its
-// node moves into that tab while it is open — plugins cannot import react-dom
-// for a portal.
-function findUsageTarget() {
+// overlay, so a hidden "home" in the status bar portals the page into that tab.
+//
+// The status bar is the only plugin area that stays mounted under an overlay:
+// the titlebar unmounts its slots while ANY overlay is open, and opening one
+// unmounts the chat composer too. The status bar itself unmounts when hidden
+// (Simple mode rests it hidden); with no home, Command Center → Usage falls back
+// to this feature's own page instead of leaving the stock panel up.
+const isCommandCenterUsage = () => {
   const hash = window.location.hash || ''
 
-  if (!hash.startsWith('#/command-center') || !/[?&]section=usage\b/.test(hash)) {
+  return hash.startsWith('#/command-center') && /[?&]section=usage\b/.test(hash)
+}
+
+function findUsageTarget() {
+  if (!isCommandCenterUsage()) {
     return null
   }
 
@@ -934,6 +950,20 @@ function findUsageTarget() {
   }
 
   return { content: main.lastElementChild, header: main.firstElementChild }
+}
+
+// What ReactDOM.createPortal returns, built by hand: plugins only get `react`,
+// and the host's own reconciler mounts this like any portal.
+const REACT_PORTAL = Symbol.for('react.portal')
+const portalKeys = new WeakMap()
+let portalSeq = 0
+
+function portal(children, container) {
+  if (!portalKeys.has(container)) {
+    portalKeys.set(container, `t3u-${++portalSeq}`)
+  }
+
+  return { $$typeof: REACT_PORTAL, children, containerInfo: container, implementation: null, key: portalKeys.get(container) }
 }
 
 // Renders graft failures into the tab instead of dying silently.
@@ -961,67 +991,42 @@ class GraftBoundary extends React.Component {
 }
 
 function UsageGraft() {
-  const hostRef = useRef(null)
-  const innerRef = useRef(null)
-  const [active, setActive] = useState(false)
+  const [target, setTarget] = useState(null)
 
   useLayoutEffect(() => {
-    const inner = innerRef.current
-    const home = hostRef.current
-    // Remove orphaned mounts left by previous hot reloads, not other plugins.
-    document.querySelectorAll('[data-t3u-host]').forEach(node => {
-      if (node !== inner) node.remove()
-    })
-    let marked = null
+    let current = null
     let hidden = null
 
-    const unmark = () => {
-      marked?.removeAttribute('data-t3u-active')
+    const release = () => {
+      current?.content.removeAttribute('data-t3u-active')
       hidden?.removeAttribute('data-t3u-hide')
-      marked = null
+      current = null
       hidden = null
     }
 
     const tick = () => {
-      const inner = innerRef.current
-      const home = hostRef.current
+      const next = findUsageTarget()
 
-      if (!inner || !home) {
+      if (next?.content !== current?.content) {
+        release()
+        current = next
+        setTarget(next)
+      }
+
+      if (!current) {
         return
       }
 
-      const target = findUsageTarget()
+      // Hides the stock panel before paint; the portal lands right after.
+      current.content.setAttribute('data-t3u-active', '')
 
-      if (target) {
-        if (marked !== target.content) {
-          unmark()
-          marked = target.content
-        }
+      // The stock 7/30/90 switch in the breadcrumb row: ours replaces it.
+      const seg = current.header?.querySelector('button[aria-pressed]')?.parentElement
 
-        marked.setAttribute('data-t3u-active', '')
-
-        if (inner.parentElement !== marked) {
-          marked.appendChild(inner)
-        }
-
-        // The stock 7/30/90 switch in the breadcrumb row: ours replaces it.
-        const seg = target.header?.querySelector('button[aria-pressed]')?.parentElement
-
-        if (seg && seg !== hidden) {
-          hidden?.removeAttribute('data-t3u-hide')
-          hidden = seg
-          seg.setAttribute('data-t3u-hide', '')
-        }
-
-        setActive(true)
-      } else {
-        unmark()
-
-        if (inner.parentElement !== home) {
-          home.appendChild(inner)
-        }
-
-        setActive(false)
+      if (seg && seg !== hidden) {
+        hidden?.removeAttribute('data-t3u-hide')
+        hidden = seg
+        seg.setAttribute('data-t3u-hide', '')
       }
     }
 
@@ -1037,25 +1042,69 @@ function UsageGraft() {
       observer.disconnect()
       window.removeEventListener('hashchange', tick)
       window.removeEventListener('popstate', tick)
-      unmark()
-
-      // Refs may already be nulled during unmount; retain the captured nodes.
-      if (inner && home && inner.parentElement !== home) {
-        home.appendChild(inner)
-      }
+      release()
     }
   }, [])
 
-  return h(
-    'span',
-    { 'aria-hidden': !active, ref: hostRef, style: { display: 'none' } },
-    h('style', null, GRAFT_CSS),
-    h(
-      'div',
-      { 'data-t3u-host': '', ref: innerRef },
-      active ? h(GraftBoundary, null, h(UsagePage, { grafted: true })) : null
-    )
-  )
+  return target
+    ? portal(h('div', { 'data-t3u-host': '' }, h(GraftBoundary, null, h(UsagePage, { grafted: true }))), target.content)
+    : null
+}
+
+// Every mounted home registers; the first one is the leader and grafts (two
+// can overlap briefly while a hot reload swaps the old mount for the new).
+let graftHomes = []
+let $graftLeader = null
+let fallbackPending = false
+
+const syncGraftLeader = () => $graftLeader?.set(graftHomes[0] ?? null)
+
+// Command Center → Usage with no home to graft from: open our own page instead
+// of leaving the stock panel up. `wait` gives homes still mounting (app boot,
+// the status bar toggling) a grace period.
+function scheduleUsageFallback(wait = 300) {
+  if (fallbackPending || !ctxRef || !isCommandCenterUsage()) {
+    return
+  }
+
+  const fallback = () => {
+    fallbackPending = false
+
+    if (!$graftLeader?.get() && isCommandCenterUsage()) {
+      window.location.replace(`#${ROUTE}`)
+    }
+  }
+
+  if (!wait) {
+    return fallback()
+  }
+
+  fallbackPending = true
+  ctxRef.setTimeout(fallback, wait)
+}
+
+const openUsage = () => host.navigate($graftLeader?.get() ? CC_USAGE : ROUTE)
+
+function UsageGraftHome() {
+  const [id] = useState(() => ({}))
+  const leader = useValue($graftLeader)
+
+  useLayoutEffect(() => {
+    graftHomes.push(id)
+    syncGraftLeader()
+
+    return () => {
+      graftHomes = graftHomes.filter(home => home !== id)
+      syncGraftLeader()
+
+      if (!graftHomes.length) {
+        scheduleUsageFallback()
+      }
+    }
+  }, [id])
+
+  // <style> is display:none, so the home adds nothing to its host row.
+  return h(React.Fragment, null, h('style', null, GRAFT_CSS), leader === id ? h(UsageGraft, null) : null)
 }
 
 // ─── registration ───────────────────────────────────────────────────────────
@@ -1069,14 +1118,18 @@ export default {
     // Coarse clock for the limits view's "resets in …" counters.
     $tick = atom(Date.now())
     ctx.setInterval(() => $tick.set(Date.now()), 15_000)
+    graftHomes = []
+    $graftLeader = atom(null)
+    ctx.addEventListener(window, 'hashchange', () => !$graftLeader.get() && scheduleUsageFallback(0))
+    scheduleUsageFallback()
 
     ctx.registerMany([
       {
-        // Command Center → Usage mount: invisible here, grafted into the tab.
+        // Command Center → Usage graft homes (see the graft note above).
         id: 'cc-graft',
         area: (STATUSBAR_AREAS && STATUSBAR_AREAS.right) || 'statusBar.right',
         order: 9999,
-        render: () => h(UsageGraft, null)
+        render: () => h(UsageGraftHome, null)
       },
       {
         id: 'page',
@@ -1101,7 +1154,7 @@ export default {
               {
                 'aria-label': 'Usage',
                 className: 'bg-transparent select-none text-muted-foreground/85 hover:bg-(--ui-control-hover-background) hover:text-foreground',
-                onClick: () => host.navigate(CC_USAGE),
+                onClick: openUsage,
                 onPointerDown: e => e.stopPropagation(),
                 size: 'icon-titlebar',
                 style: { order: -1 },
@@ -1119,7 +1172,7 @@ export default {
           id: `${NS}.open`,
           label: 'Open Usage',
           keywords: ['usage', 'tokens', 'cost', 'spend', 'limits', 'analytics'],
-          run: () => host.navigate(CC_USAGE)
+          run: openUsage
         }
       }
     ])

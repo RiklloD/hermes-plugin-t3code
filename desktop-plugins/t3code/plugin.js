@@ -710,7 +710,22 @@ async function fetchSessions(conn, includeCron, limit) {
     fetchSessionRows(limit, includeCron),
     inboxRest(`/outcomes?limit=${Math.min(1e4, limit)}`).catch(() => null)
   ]);
-  const sessions = roster.sessions.map((s) => ({ ...withOutcome(s, outcomes?.[profileOf(s)]?.[s.id]), _conn: conn }));
+  const before = new Map(cachedRows().map((s) => [keyOf(s), s]));
+  const sessions = roster.sessions.map((s) => {
+    const old = before.get(keyOf({ ...s, _conn: conn }));
+    const row = outcomes ? withOutcome(s, outcomes[profileOf(s)]?.[s.id]) : old ? { ...s, limit_reset_at: old.limit_reset_at, outcome: old.outcome, outcome_at: old.outcome_at, sent_at: old.sent_at } : s;
+    return { ...row, _conn: conn };
+  });
+  const readElsewhere = {};
+  for (const s of sessions) {
+    const old = before.get(keyOf(s));
+    if (old?.unread && s.unread === false) {
+      readElsewhere[keyOf(s)] = { visitedAt: Date.now() };
+    }
+  }
+  if (Object.keys(readElsewhere).length) {
+    writeRecs(readElsewhere);
+  }
   for (const s of sessions) {
     const o = pinOverlay.get(keyOf(s));
     if (o && typeof s.pinned === "boolean" && s.pinned === o.pinned) {
@@ -801,6 +816,40 @@ function markOwnerUnreachable(owner) {
     setOwnerLive(owner, { ...entry, stale: true });
   }
 }
+var IDLE_GRACE_MS = 7e3;
+function mergeTurnStarts(prev, fresh, statuses) {
+  const out = { ...fresh };
+  for (const id of Object.keys(prev?.turnStarts || {})) {
+    if (out[id] === void 0 && (statuses[id] === "working" || statuses[id] === "waiting")) {
+      out[id] = prev.turnStarts[id];
+    }
+  }
+  return out;
+}
+function holdLive(prev, statuses, runtime, background, delegationOk, now) {
+  const busyAt = {};
+  const backgroundAt = {};
+  const heldBackground = { ...background };
+  const ids = /* @__PURE__ */ new Set([...Object.keys(statuses), ...Object.keys(prev?.statuses || {}), ...Object.keys(background), ...Object.keys(prev?.background || {})]);
+  for (const id of ids) {
+    if (statuses[id] === "working" || statuses[id] === "waiting") {
+      busyAt[id] = now;
+    } else if (prev && (prev.statuses[id] === "working" || prev.statuses[id] === "waiting") && now - (prev.busyAt?.[id] || 0) < IDLE_GRACE_MS) {
+      statuses[id] = "working";
+      runtime[id] = runtime[id] || prev.runtime[id];
+      busyAt[id] = prev.busyAt?.[id] || now;
+    }
+    if ((background[id] || 0) > 0) {
+      backgroundAt[id] = now;
+    } else if (prev && (prev.background[id] || 0) > 0 && now - (prev.backgroundAt?.[id] || 0) < IDLE_GRACE_MS) {
+      heldBackground[id] = prev.background[id];
+      backgroundAt[id] = prev.backgroundAt?.[id] || now;
+    } else if (!delegationOk && prev?.backgroundAt?.[id]) {
+      backgroundAt[id] = prev.backgroundAt[id];
+    }
+  }
+  return { background: heldBackground, backgroundAt, busyAt };
+}
 async function pollOwner(owner, request) {
   const gen = connGeneration;
   let res;
@@ -824,21 +873,39 @@ async function pollOwner(owner, request) {
   const prev = $live.get().owners[owner];
   const statuses = {};
   const runtime = {};
+  const turnStarts = {};
+  const nativeBackground = {};
   for (const row of res?.sessions || []) {
     const stored = row.session_key || row.id;
     if (stored) {
       statuses[stored] = row.status;
       runtime[stored] = row.id;
+      if (row.background_tasks > 0) {
+        nativeBackground[stored] = row.background_tasks;
+      }
+      if (row.turn_started_at) {
+        turnStarts[stored] = row.turn_started_at * 1e3;
+      }
     }
   }
-  const background = {};
-  for (const child of delegation?.active || []) {
-    const parent = child.owner_agent_session_id;
-    if (parent) {
-      background[parent] = (background[parent] || 0) + 1;
+  let background = {};
+  if (delegation) {
+    for (const child of delegation.active || []) {
+      const parent = child.owner_agent_session_id;
+      if (parent) {
+        background[parent] = (background[parent] || 0) + 1;
+      }
     }
+  } else if (prev) {
+    background = { ...prev.delegated || prev.background };
+  }
+  const delegated = { ...background };
+  for (const [id, n] of Object.entries(nativeBackground)) {
+    background[id] = (background[id] || 0) + n;
   }
   const now = Date.now();
+  const held = holdLive(prev, statuses, runtime, background, delegation !== null, now);
+  background = held.background;
   const pending = {};
   const waitingSince = {};
   for (const [id, status] of Object.entries(statuses)) {
@@ -850,7 +917,7 @@ async function pollOwner(owner, request) {
       }
     }
   }
-  const next = { background, pending, runtime, stale: false, statuses, waitingSince };
+  const next = { delegated, turnStarts: mergeTurnStarts(prev, turnStarts, statuses), background, backgroundAt: held.backgroundAt, busyAt: held.busyAt, pending, runtime, stale: false, statuses, waitingSince };
   if (prev) {
     recordEdges(owner, prev, next);
   }
@@ -889,7 +956,6 @@ function resetSourceState() {
   connGeneration += 1;
   $live.set({ owners: {} });
   lastLiveOk.clear();
-  workingSince = /* @__PURE__ */ new Map();
   rowCache = /* @__PURE__ */ new Map();
   $selection.set({ anchor: null, keys: [] });
   void pullLifecycle();
@@ -1041,6 +1107,21 @@ async function recoverLimited() {
     writeRecovery(rec);
   }
 }
+var orchestratorChecked = 0;
+var orchestratorOwns = false;
+async function orchestratorOwnsRestarts() {
+  if (Date.now() - orchestratorChecked < INTERRUPTED_POLL_MS) {
+    return orchestratorOwns;
+  }
+  orchestratorChecked = Date.now();
+  try {
+    const settings2 = await api({ path: "/api/plugins/t3code/orchestrator/settings", timeoutMs: 15e3 });
+    orchestratorOwns = Boolean(settings2?.continue_after_restart);
+  } catch {
+    orchestratorOwns = false;
+  }
+  return orchestratorOwns;
+}
 async function runRecovery() {
   if (recoveryBusy) {
     return;
@@ -1048,7 +1129,7 @@ async function runRecovery() {
   recoveryBusy = true;
   try {
     await recoverLimited();
-    if ($prefs.get().resumeAfterCrash && Date.now() - lastInterruptedAt > INTERRUPTED_POLL_MS) {
+    if ($prefs.get().resumeAfterCrash && Date.now() - lastInterruptedAt > INTERRUPTED_POLL_MS && !await orchestratorOwnsRestarts()) {
       if (await recoverInterrupted()) {
         lastInterruptedAt = Date.now();
       }
@@ -1060,6 +1141,11 @@ async function runRecovery() {
 }
 var isFailure = (outcome) => outcome === "failed" || outcome === "limited";
 var BUSY = /* @__PURE__ */ new Set(["working"]);
+function turnStartFor(rec, s, now) {
+  const sent = Math.max(s.sent_at ? s.sent_at * 1e3 : 0, rec.sentAt || 0);
+  const ended = Math.max(rec.returnedAt || 0, s.outcome_at ? s.outcome_at * 1e3 : 0);
+  return sent && sent >= ended && sent <= now && now - sent < DAY ? sent : now;
+}
 function deriveRow(s, cx) {
   const { life, live: live2, prefs, now, focusedId, pinOrder } = cx;
   const key = keyOf(s);
@@ -1076,11 +1162,16 @@ function deriveRow(s, cx) {
   const backgroundCount = src ? ids.reduce((n, id) => n + (src.background[id] || 0), 0) : 0;
   const background = !busy && !waiting && backgroundCount > 0;
   const waitingSince = waiting ? find(src?.waitingSince) || now : null;
-  if (busy || background) {
+  if (busy || background || waiting) {
     if (!workingSince.has(key)) {
-      workingSince.set(key, Date.now());
+      workingSince.set(key, find(src?.turnStarts) || turnStartFor(rec, s, now));
+    } else {
+      const server = find(src?.turnStarts);
+      if (server && server !== workingSince.get(key)) {
+        workingSince.set(key, server);
+      }
     }
-  } else {
+  } else if (src && !src.stale) {
     workingSince.delete(key);
   }
   const outcome = s.outcome || null;
@@ -1406,7 +1497,9 @@ function patchSession(row, body) {
   });
 }
 function setUnread(rows, unread) {
-  for (const row of asList(rows)) {
+  const list = asList(rows);
+  writeRecs(Object.fromEntries(list.map((r) => [r.key, { visitedAt: unread ? null : Date.now() }])));
+  for (const row of list) {
     patchCachedRows((list) => list.map((s) => sameSession(s, row.s) ? { ...s, unread } : s));
     patchSession(row, { unread }).catch((err) => host.notifyError(err, "Could not update read state")).finally(refresh);
   }
@@ -1516,10 +1609,11 @@ function StatusLabel({ row, now }) {
         {
           className: "t3i-status t3i-c-info",
           "data-stale": stale,
-          title: staleTitle(row) || `${plural(row.backgroundCount, "delegated task")} still running`
+          title: staleTitle(row) || `${plural(row.backgroundCount, "background task")} still running`
         },
         h(Icon, { name: "users", size: 14 }),
-        h("b", { role: "status" }, "Background")
+        h("b", { role: "status" }, "Background"),
+        row.stale ? null : h(WorkingTimer, { since: row.workingStartedAt })
       );
     case "approval":
       return h(
@@ -3204,7 +3298,7 @@ function SettingsPage() {
     }),
     h(ToggleRow, {
       checked: prefs.resumeAfterCrash,
-      description: "When Hermes reopens, threads that were mid-turn when the app or backend stopped continue on their own, like T3 Code\u2019s \u201CContinue threads after server update\u201D. Settled, snoozed and archived threads are left alone, and a thread is restarted at most three times in a row.",
+      description: "When Hermes reopens, threads that were mid-turn when the app or backend stopped continue on their own, like T3 Code\u2019s \u201CContinue threads after server update\u201D. Settled, snoozed and archived threads are left alone, and a thread is restarted at most three times in a row. While the Orchestrator\u2019s \u201CContinue threads after restarts\u201D is on, the Orchestrator handles this (it also covers updates and quits).",
       label: "Resume interrupted threads on launch",
       onChange: (v) => setPrefs({ resumeAfterCrash: v })
     }),
@@ -3338,8 +3432,13 @@ var desktop_default = {
         $pinsVersion.set($pinsVersion.get() + 1);
       }
     });
+    let lastFocusedKey = null;
     ctx.onDispose(
       host.state.focusedStoredSessionId.subscribe((id) => {
+        if (lastFocusedKey) {
+          markVisited(lastFocusedKey);
+          lastFocusedKey = null;
+        }
         if (!id) {
           return;
         }
@@ -3349,7 +3448,8 @@ var desktop_default = {
           if (connOf(s) === "local") {
             openedProfiles.add(profileOf(s));
           }
-          markVisited(keyOf(s));
+          lastFocusedKey = keyOf(s);
+          markVisited(lastFocusedKey);
         }
       })
     );
@@ -3641,7 +3741,8 @@ function ContextStrip() {
   const lines = [];
   const lin = data.lineage || {};
   const queue = data.queue || { items: [] };
-  const armed = (data.recoveries || []).filter((r) => r.status === "armed");
+  const armed = (data.recoveries || []).filter((r) => r.status === "armed" && r.kind !== "restart");
+  const restarting = (data.recoveries || []).filter((r) => r.status === "armed" && r.kind === "restart");
   const pendingDelivery = (data.tasks || []).filter((t) => t.delivery === "pending").length;
   if (data.asChild) {
     const t = data.asChild;
@@ -3691,6 +3792,16 @@ function ContextStrip() {
         key: r.id,
         tone: "warn"
       }, "Usage limit reached \u2014 continues automatically at ", h2("b", null, clock(r.reset_at)), ` (in ${until(r.reset_at, now)})`)
+    );
+  }
+  for (const r of restarting) {
+    lines.push(
+      h2(Line, {
+        actions: h2(Btn, { danger: true, label: "Cancel", onClick: () => act(() => post(`/recoveries/${r.id}/cancel`)) }),
+        icon: "\u21BB",
+        key: r.id,
+        tone: "info"
+      }, "Hermes restarted \u2014 this turn continues where it left off")
     );
   }
   if (queue.held && (queue.items.length || pendingDelivery)) {
@@ -3784,7 +3895,7 @@ function SettingsPage2() {
       "div",
       null,
       h2("h3", null, "Recovery & delegation"),
-      toggle("continue_after_restart", "Continue interrupted turns after a restart", "Resumes turns and delegated tasks a backend restart cut short, without reopening each chat."),
+      toggle("continue_after_restart", "Continue threads after restarts", "After an update, quit or crash, turns and delegated tasks the restart cut short get \u201CContinue where you left off.\u201D, with a note of background work it cancelled. Not for settled, snoozed or archived chats, chats waiting on your answer, or a turn that restarted 3 times in a row."),
       toggle("resume_on_usage_limit", "Resume when a usage limit resets", "Sends \u201CContinue where you left off.\u201D once the provider limit lifts."),
       toggle("cross_profile_delegation", "Allow delegating to other profiles", "A chat may hand a task to another profile, which runs as itself (its memory, persona, model)."),
       toggle("harness_switch", "Switch harness inside a chat", "Pick Claude CLI in a chat that started on another model (or the reverse): the chat continues with a context handoff instead of needing a new chat.")
@@ -3856,6 +3967,9 @@ var desktop_default2 = {
     for (const name of ["task.updated", "queue.updated", "lineage.updated", "recovery.updated", "schedules.updated", "session.stopped", "session.turn"]) {
       ctx.onEvent(EVENT(name), (ev) => {
         if (name === "task.updated" && ev?.payload?.taskId) $tasks.set({ ...$tasks.get(), [ev.payload.taskId]: ev.payload });
+        if (name === "recovery.updated" && ev?.payload?.kind === "restart" && ev.payload.status === "fired") {
+          toast(ev.payload.title ? `${ev.payload.summary}: \u201C${ev.payload.title}\u201D` : ev.payload.summary);
+        }
         invalidate();
       });
     }
@@ -4262,12 +4376,12 @@ function LimitsView({ data, error, loading }) {
       const title = [meta.label, p.plan ? p.plan.charAt(0).toUpperCase() + p.plan.slice(1) : null].filter(Boolean).join(" \xB7 ");
       return h3(
         "section",
-        { className: "t3u-limit-card", key: p.provider },
+        { className: "t3u-limit-card", key: p.account_id || p.provider },
         h3(
           "div",
           { className: "t3u-limit-head" },
           h3(ProviderMark, { provider: p.provider }),
-          h3("h2", null, title),
+          h3("h2", null, p.account_label ? `${title} \xB7 ${p.account_label}` : title),
           p.account ? h3("span", { className: "t3u-muted t3u-trunc" }, p.account) : null
         ),
         p.observedAt ? h3("p", { className: "t3u-muted", style: { margin: 0 } }, `As of ${new Date(p.observedAt).toLocaleString(void 0, { day: "numeric", hour: "numeric", minute: "2-digit", month: "short" })} (reported during Muse Code turns)`) : null,
@@ -4423,7 +4537,21 @@ function UsagePage({ grafted = false }) {
                 { className: "t3u-muted" },
                 metric === "cost" ? `${fmtPct(share)} of cost \xB7 ${fmtTokens(p.tokens)} tokens` : `${fmtPct(share)} of tokens \xB7 ${fmtUsd(p.cost)}`
               ),
-              via.hermes ? h3("small", { className: "t3u-muted" }, `${fmtTokens(via.hermes)} via Hermes \xB7 ${fmtTokens(via.cli || 0)} via the CLI`) : null
+              via.hermes ? h3("small", { className: "t3u-muted" }, `${fmtTokens(via.hermes)} via Hermes \xB7 ${fmtTokens(via.cli || 0)} via the CLI`) : null,
+              p.accounts && p.accounts.length > 0 ? h3(
+                "div",
+                { className: "t3u-muted", style: { display: "flex", gap: 16, marginTop: 2 } },
+                p.accounts.map((acc) => h3(
+                  "span",
+                  { key: acc.id },
+                  `${acc.label}: `,
+                  h3(
+                    "b",
+                    { style: { fontVariantNumeric: "tabular-nums", color: "var(--ui-text-secondary)" } },
+                    fmt(metric === "cost" ? acc.cost : acc.tokens)
+                  )
+                ))
+              ) : null
             );
           })
         ),
@@ -4670,9 +4798,12 @@ var GRAFT_CSS = `[data-t3u-active] > :not([data-t3u-host]){display:none !importa
 [data-t3u-hide]{display:none !important}
 [data-t3u-host]{display:flex;flex-direction:column;flex:1;min-height:0}
 `;
-function findUsageTarget() {
+var isCommandCenterUsage = () => {
   const hash = window.location.hash || "";
-  if (!hash.startsWith("#/command-center") || !/[?&]section=usage\b/.test(hash)) {
+  return hash.startsWith("#/command-center") && /[?&]section=usage\b/.test(hash);
+};
+function findUsageTarget() {
+  if (!isCommandCenterUsage()) {
     return null;
   }
   const nav = document.querySelector('[data-tour="overlay-nav"]');
@@ -4685,6 +4816,15 @@ function findUsageTarget() {
     return null;
   }
   return { content: main.lastElementChild, header: main.firstElementChild };
+}
+var REACT_PORTAL = /* @__PURE__ */ Symbol.for("react.portal");
+var portalKeys = /* @__PURE__ */ new WeakMap();
+var portalSeq = 0;
+function portal(children, container) {
+  if (!portalKeys.has(container)) {
+    portalKeys.set(container, `t3u-${++portalSeq}`);
+  }
+  return { $$typeof: REACT_PORTAL, children, containerInfo: container, implementation: null, key: portalKeys.get(container) };
 }
 var GraftBoundary = class extends React3.Component {
   constructor(props) {
@@ -4706,52 +4846,32 @@ var GraftBoundary = class extends React3.Component {
   }
 };
 function UsageGraft() {
-  const hostRef = useRef2(null);
-  const innerRef = useRef2(null);
-  const [active, setActive] = useState3(false);
+  const [target, setTarget] = useState3(null);
   useLayoutEffect(() => {
-    const inner = innerRef.current;
-    const home = hostRef.current;
-    document.querySelectorAll("[data-t3u-host]").forEach((node) => {
-      if (node !== inner) node.remove();
-    });
-    let marked = null;
+    let current = null;
     let hidden = null;
-    const unmark = () => {
-      marked?.removeAttribute("data-t3u-active");
+    const release = () => {
+      current?.content.removeAttribute("data-t3u-active");
       hidden?.removeAttribute("data-t3u-hide");
-      marked = null;
+      current = null;
       hidden = null;
     };
     const tick = () => {
-      const inner2 = innerRef.current;
-      const home2 = hostRef.current;
-      if (!inner2 || !home2) {
+      const next = findUsageTarget();
+      if (next?.content !== current?.content) {
+        release();
+        current = next;
+        setTarget(next);
+      }
+      if (!current) {
         return;
       }
-      const target = findUsageTarget();
-      if (target) {
-        if (marked !== target.content) {
-          unmark();
-          marked = target.content;
-        }
-        marked.setAttribute("data-t3u-active", "");
-        if (inner2.parentElement !== marked) {
-          marked.appendChild(inner2);
-        }
-        const seg = target.header?.querySelector("button[aria-pressed]")?.parentElement;
-        if (seg && seg !== hidden) {
-          hidden?.removeAttribute("data-t3u-hide");
-          hidden = seg;
-          seg.setAttribute("data-t3u-hide", "");
-        }
-        setActive(true);
-      } else {
-        unmark();
-        if (inner2.parentElement !== home2) {
-          home2.appendChild(inner2);
-        }
-        setActive(false);
+      current.content.setAttribute("data-t3u-active", "");
+      const seg = current.header?.querySelector("button[aria-pressed]")?.parentElement;
+      if (seg && seg !== hidden) {
+        hidden?.removeAttribute("data-t3u-hide");
+        hidden = seg;
+        seg.setAttribute("data-t3u-hide", "");
       }
     };
     const observer = new MutationObserver(tick);
@@ -4763,22 +4883,47 @@ function UsageGraft() {
       observer.disconnect();
       window.removeEventListener("hashchange", tick);
       window.removeEventListener("popstate", tick);
-      unmark();
-      if (inner && home && inner.parentElement !== home) {
-        home.appendChild(inner);
-      }
+      release();
     };
   }, []);
-  return h3(
-    "span",
-    { "aria-hidden": !active, ref: hostRef, style: { display: "none" } },
-    h3("style", null, GRAFT_CSS),
-    h3(
-      "div",
-      { "data-t3u-host": "", ref: innerRef },
-      active ? h3(GraftBoundary, null, h3(UsagePage, { grafted: true })) : null
-    )
-  );
+  return target ? portal(h3("div", { "data-t3u-host": "" }, h3(GraftBoundary, null, h3(UsagePage, { grafted: true }))), target.content) : null;
+}
+var graftHomes = [];
+var $graftLeader = null;
+var fallbackPending = false;
+var syncGraftLeader = () => $graftLeader?.set(graftHomes[0] ?? null);
+function scheduleUsageFallback(wait = 300) {
+  if (fallbackPending || !ctxRef3 || !isCommandCenterUsage()) {
+    return;
+  }
+  const fallback = () => {
+    fallbackPending = false;
+    if (!$graftLeader?.get() && isCommandCenterUsage()) {
+      window.location.replace(`#${ROUTE}`);
+    }
+  };
+  if (!wait) {
+    return fallback();
+  }
+  fallbackPending = true;
+  ctxRef3.setTimeout(fallback, wait);
+}
+var openUsage = () => host3.navigate($graftLeader?.get() ? CC_USAGE : ROUTE);
+function UsageGraftHome() {
+  const [id] = useState3(() => ({}));
+  const leader = useValue3($graftLeader);
+  useLayoutEffect(() => {
+    graftHomes.push(id);
+    syncGraftLeader();
+    return () => {
+      graftHomes = graftHomes.filter((home) => home !== id);
+      syncGraftLeader();
+      if (!graftHomes.length) {
+        scheduleUsageFallback();
+      }
+    };
+  }, [id]);
+  return h3(React3.Fragment, null, h3("style", null, GRAFT_CSS), leader === id ? h3(UsageGraft, null) : null);
 }
 var desktop_default3 = {
   id: "usage",
@@ -4789,13 +4934,17 @@ var desktop_default3 = {
     if (![1, 7, 30, 90].includes($usagePrefs.get().days)) $usagePrefs.set({ ...$usagePrefs.get(), days: 30 });
     $tick2 = atom3(Date.now());
     ctx.setInterval(() => $tick2.set(Date.now()), 15e3);
+    graftHomes = [];
+    $graftLeader = atom3(null);
+    ctx.addEventListener(window, "hashchange", () => !$graftLeader.get() && scheduleUsageFallback(0));
+    scheduleUsageFallback();
     ctx.registerMany([
       {
-        // Command Center → Usage mount: invisible here, grafted into the tab.
+        // Command Center → Usage graft homes (see the graft note above).
         id: "cc-graft",
         area: STATUSBAR_AREAS && STATUSBAR_AREAS.right || "statusBar.right",
         order: 9999,
-        render: () => h3(UsageGraft, null)
+        render: () => h3(UsageGraftHome, null)
       },
       {
         id: "page",
@@ -4819,7 +4968,7 @@ var desktop_default3 = {
             {
               "aria-label": "Usage",
               className: "bg-transparent select-none text-muted-foreground/85 hover:bg-(--ui-control-hover-background) hover:text-foreground",
-              onClick: () => host3.navigate(CC_USAGE),
+              onClick: openUsage,
               onPointerDown: (e) => e.stopPropagation(),
               size: "icon-titlebar",
               style: { order: -1 },
@@ -4837,7 +4986,7 @@ var desktop_default3 = {
           id: `${NS3}.open`,
           label: "Open Usage",
           keywords: ["usage", "tokens", "cost", "spend", "limits", "analytics"],
-          run: () => host3.navigate(CC_USAGE)
+          run: openUsage
         }
       }
     ]);
@@ -4861,6 +5010,9 @@ var {
 } = sdk4;
 var h4 = React4.createElement;
 var QUERY = "t3code-claude-context";
+var ACCOUNTS_QUERY = "t3code-claude-accounts";
+var featureCtx = null;
+var CLAUDE_PROVIDERS = ["claude-cli", "claude-cli-2"];
 function hasNativeMillion(model) {
   const match = model.match(/^claude-(opus|sonnet|haiku|fable)-(\d+)(?:-(\d+))?$/);
   if (!match) return false;
@@ -4882,7 +5034,7 @@ function ContextPicker() {
     staleTime: 3e4,
     retry: false
   });
-  if (!info || info.provider !== "claude-cli" || !String(info.model || "").startsWith("claude-")) return null;
+  if (!info || !CLAUDE_PROVIDERS.includes(info.provider) || !String(info.model || "").startsWith("claude-")) return null;
   const model = info.model || "";
   const base = model.replace(/\[(200k|1m)\]$/i, "");
   const million = hasNativeMillion(base) || /\[1m\]$/i.test(model);
@@ -4892,7 +5044,7 @@ function ContextPicker() {
     const target = context === "200k" ? `${base}[200k]` : `${base}[1m]`;
     if (target === model) return;
     setSaving(true);
-    const params = { session_id: sessionId, key: "model", value: `${target} --provider claude-cli --session` };
+    const params = { session_id: sessionId, key: "model", value: `${target} --provider ${info.provider} --session` };
     const stale = () => host4.state.focusedSessionId.get() !== sessionId || host4.state.focusedSessionOwner.get()?.connectionId !== owner.connectionId;
     try {
       const result = await host4.requestProfile(route, "config.set", params);
@@ -4943,9 +5095,79 @@ function ContextPicker() {
     )
   );
 }
+function AccountsPanel() {
+  const owner = useValue4(host4.state.focusedSessionOwner);
+  const { data, error, isFetching, refetch } = useQuery4({
+    queryKey: [ACCOUNTS_QUERY, owner?.connectionId, owner?.profile],
+    queryFn: () => featureCtx.rest("/accounts", { timeoutMs: 25e3 }),
+    staleTime: 3e4,
+    refetchInterval: 6e4,
+    retry: false
+  });
+  const accounts = data?.accounts || [];
+  const anyNeedsLogin = accounts.some((a) => !a.logged_in);
+  const triggerColor = anyNeedsLogin ? "var(--ui-yellow)" : "var(--ui-text-tertiary)";
+  return h4(
+    DropdownMenu2,
+    null,
+    h4(
+      DropdownMenuTrigger2,
+      { asChild: true },
+      h4("button", {
+        title: "Claude account status",
+        style: { color: triggerColor, padding: "0 6px", fontSize: "inherit", opacity: isFetching ? 0.6 : 1 }
+      }, "Claude")
+    ),
+    h4(
+      DropdownMenuContent2,
+      { align: "end" },
+      h4("div", { style: { padding: "6px 8px", fontWeight: 600 } }, "Claude accounts"),
+      accounts.length === 0 ? h4("div", { style: { padding: "6px 8px", fontSize: 12, color: "var(--ui-text-tertiary)", maxWidth: 300 } }, error ? "Account status unavailable. Restart Hermes after the backend update." : "Loading\u2026") : accounts.map(
+        (acc) => h4(
+          React4.Fragment,
+          { key: acc.id },
+          h4(
+            "div",
+            { style: { padding: "6px 8px 2px", display: "flex", alignItems: "center", gap: 8 } },
+            h4("span", { style: { fontWeight: 500 } }, acc.label),
+            h4("span", {
+              style: {
+                marginLeft: "auto",
+                fontSize: 11,
+                color: acc.logged_in ? "var(--ui-green)" : "var(--ui-yellow)"
+              }
+            }, acc.logged_in ? "\u25CF signed in" : "\u25CB not signed in")
+          ),
+          acc.email ? h4("div", { style: { padding: "0 8px 2px", fontSize: 11, color: "var(--ui-text-tertiary)" } }, acc.email) : null,
+          acc.plan ? h4("div", { style: { padding: "0 8px 2px", fontSize: 11, color: "var(--ui-text-tertiary)" } }, acc.plan) : null,
+          !acc.logged_in && acc.login_command ? h4(DropdownMenuItem2, {
+            onSelect: async () => {
+              try {
+                await navigator.clipboard.writeText(acc.login_command);
+                host4.notify({ kind: "success", message: "Native login command copied. Run it in your terminal." });
+              } catch {
+                host4.notify({ kind: "error", message: "Could not copy the login command." });
+              }
+            },
+            style: { fontSize: 11, fontFamily: "monospace", color: "var(--ui-text-secondary)", maxWidth: 360, overflow: "hidden", textOverflow: "ellipsis" }
+          }, `Copy: ${acc.login_command}`) : null
+        )
+      ),
+      h4(DropdownMenuSeparator2),
+      h4(DropdownMenuItem2, { disabled: isFetching, onSelect: () => void refetch() }, "Refresh accounts"),
+      h4(
+        "div",
+        { style: { padding: "4px 8px 6px", fontSize: 11, color: "var(--ui-text-tertiary)", whiteSpace: "normal", maxWidth: 300 } },
+        "Choose Claude CLI for account A or Claude CLI 2 for account B in a new chat\u2019s model picker. Existing chats stay bound to their account."
+      )
+    )
+  );
+}
 var desktop_default4 = {
   register(ctx) {
+    featureCtx = ctx;
     ctx.register({ id: "context-window", area: "statusBar.right", order: -10, render: () => h4(ContextPicker) });
+    ctx.register({ id: "claude-accounts", area: "statusBar.right", order: -9, render: () => h4(AccountsPanel) });
     ctx.onEvent("session.info", () => {
       void queryClient4.invalidateQueries({ queryKey: [QUERY] });
     });

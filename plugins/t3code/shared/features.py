@@ -55,7 +55,7 @@ FEATURES: Dict[str, Feature] = {
         Feature("usage", "Usage", "t3-usage", api=True),
         Feature("goals", "Goals", "", api=True),
         Feature("orchestrator", "Orchestrator", "t3-orchestrator", agent=True, api=True, restart=True),
-        Feature("claude_cli", "Claude CLI", "claude-cli", restart=True),
+        Feature("claude_cli", "Claude CLI", "claude-cli", api=True, restart=True),
         Feature("muse_code", "Muse Code", "muse-code", restart=True),
         Feature("antigravity", "Antigravity", "antigravity", restart=True),
     )

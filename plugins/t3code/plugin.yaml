@@ -73,6 +73,11 @@ config_schema:
     default: ""
     label: "Claude CLI · config directory"
     description: Optional native Claude configuration directory (changing it needs a new chat).
+  claude_second_config_directory:
+    type: string
+    default: ""
+    label: "Claude CLI · second account config directory"
+    description: Config directory for the second Claude account (defaults to ~/.claude-account2 when empty). Adds a second provider "Claude CLI 2" in the model picker. Changing it needs a new chat.
   claude_permission_mode:
     type: string
     default: default

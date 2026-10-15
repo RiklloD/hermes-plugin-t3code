@@ -1399,6 +1399,29 @@ async function recoverLimited() {
   }
 }
 
+// The Orchestrator owns restart continuation in the backend while its switch is on (T3's
+// server-side RestartContinuation: shutdown capture, crash snapshot, chain cap, background note).
+// The Inbox only covers crashes itself when that feature is off, so no thread is continued twice.
+let orchestratorChecked = 0
+let orchestratorOwns = false
+
+async function orchestratorOwnsRestarts() {
+  if (Date.now() - orchestratorChecked < INTERRUPTED_POLL_MS) {
+    return orchestratorOwns
+  }
+
+  orchestratorChecked = Date.now()
+
+  try {
+    const settings = await api({ path: '/api/plugins/t3code/orchestrator/settings', timeoutMs: 15_000 })
+    orchestratorOwns = Boolean(settings?.continue_after_restart)
+  } catch {
+    orchestratorOwns = false
+  }
+
+  return orchestratorOwns
+}
+
 async function runRecovery() {
   if (recoveryBusy) {
     return
@@ -1409,7 +1432,11 @@ async function runRecovery() {
   try {
     await recoverLimited()
 
-    if ($prefs.get().resumeAfterCrash && Date.now() - lastInterruptedAt > INTERRUPTED_POLL_MS) {
+    if (
+      $prefs.get().resumeAfterCrash &&
+      Date.now() - lastInterruptedAt > INTERRUPTED_POLL_MS &&
+      !(await orchestratorOwnsRestarts())
+    ) {
       if (await recoverInterrupted()) {
         lastInterruptedAt = Date.now()
       }
@@ -4121,7 +4148,7 @@ function SettingsPage() {
     h(ToggleRow, {
       checked: prefs.resumeAfterCrash,
       description:
-        'When Hermes reopens, threads that were mid-turn when the app or backend stopped continue on their own, like T3 Code’s “Continue threads after server update”. Settled, snoozed and archived threads are left alone, and a thread is restarted at most three times in a row.',
+        'When Hermes reopens, threads that were mid-turn when the app or backend stopped continue on their own, like T3 Code’s “Continue threads after server update”. Settled, snoozed and archived threads are left alone, and a thread is restarted at most three times in a row. While the Orchestrator’s “Continue threads after restarts” is on, the Orchestrator handles this (it also covers updates and quits).',
       label: 'Resume interrupted threads on launch',
       onChange: v => setPrefs({ resumeAfterCrash: v })
     }),

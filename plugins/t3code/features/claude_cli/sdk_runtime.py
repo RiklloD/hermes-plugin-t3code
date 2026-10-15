@@ -6,6 +6,7 @@ import asyncio
 import contextvars
 import queue
 import threading
+import time
 import uuid
 
 from agent.native_runtime import NativeAgentRuntime
@@ -57,6 +58,7 @@ class ClaudeRuntime(NativeAgentRuntime):
         self._worker_task = None
         self._client = None
         self._pending = {}
+        self._tasks = {}
         self._active_events = None
         self._worker_error = None
         self._interrupt_pending = threading.Event()
@@ -158,6 +160,29 @@ class ClaudeRuntime(NativeAgentRuntime):
                 await asyncio.gather(self._reader_task, return_exceptions=True)
                 self._client = None
 
+    # A background Bash, Monitor or subagent outlives the turn that started it; the thread is not
+    # done while one is running, because its result wakes the conversation again.
+    TASK_MAX_AGE = 6 * 3600
+
+    def _track_task(self, message):
+        from claude_agent_sdk.types import (TERMINAL_TASK_STATUSES, TaskNotificationMessage,
+                                            TaskStartedMessage, TaskUpdatedMessage)
+        if isinstance(message, TaskStartedMessage):
+            self._tasks[message.task_id] = time.time()
+        elif isinstance(message, (TaskNotificationMessage, TaskUpdatedMessage)):
+            status = message.status if isinstance(message, TaskNotificationMessage) else (
+                message.status or (message.patch or {}).get("status"))
+            if status in TERMINAL_TASK_STATUSES:
+                self._tasks.pop(message.task_id, None)
+
+    def background_task_count(self):
+        """Native tasks still running plus wake receipts not yet delivered; 0 once everything is settled."""
+        cutoff = time.time() - self.TASK_MAX_AGE
+        for task_id, started in list(self._tasks.items()):
+            if started < cutoff:
+                self._tasks.pop(task_id, None)
+        return len(self._tasks) + len(self._background.pending)
+
     def _route(self, event):
         if self._route_events is None:
             self._route_events = self._background.create()
@@ -170,6 +195,7 @@ class ClaudeRuntime(NativeAgentRuntime):
         projector = Projector(self.cwd, str(self.settings.get("config_directory") or ""))
         try:
             async for message in client.receive_messages():
+                self._track_task(message)
                 native_id = getattr(message, "session_id", None)
                 if native_id:
                     state.update(session_id=native_id, config_directory=projector.config_directory)
@@ -195,6 +221,7 @@ class ClaudeRuntime(NativeAgentRuntime):
             raise
         except Exception as exc:
             self._worker_error = exc
+            self._tasks.clear()
             self._route({"type": "worker_error", "error": str(exc)})
             self._route_events.put(None)
             self._native_idle.set()

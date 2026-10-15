@@ -157,6 +157,44 @@ def stop_latched(session: Optional[dict]) -> bool:
     return bool(session and session.get("_turn_cancel_requested"))
 
 
+def awaiting_user(sid: str, session: Optional[dict]) -> bool:
+    """The turn is parked on a person: an approval, a question or a secret request is open."""
+    srv = server()
+    if srv is None or not session:
+        return False
+    with contextlib.suppress(Exception):
+        if srv._open_requests(sid):
+            return True
+    with contextlib.suppress(Exception):
+        if srv._pending_approval_request_payload(str(session.get("session_key") or "")):
+            return True
+    return False
+
+
+def wrap_global(name: str, before: Callable[[], None]) -> bool:
+    """Run ``before`` ahead of one server-level function. Split gateway modules are rebound onto
+    ``server``'s globals, so every caller (signal handler, atexit) resolves the name there at call time."""
+    srv = server()
+    original = getattr(srv, name, None) if srv is not None else None
+    if not callable(original):
+        return False
+    hooks = getattr(original, WRAP_MARK, None)
+    if isinstance(hooks, dict):
+        hooks["before"] = before
+        return True
+    hooks = {"before": before}
+
+    def wrapper(*args, **kwargs):
+        with contextlib.suppress(Exception):
+            hooks["before"]()
+        return original(*args, **kwargs)
+
+    setattr(wrapper, WRAP_MARK, hooks)
+    wrapper.__wrapped__ = original  # type: ignore[attr-defined]
+    setattr(srv, name, wrapper)
+    return True
+
+
 def ensure_live(key: str, profile: Optional[str] = None, *, build: bool = True) -> tuple[str, dict]:
     """Return the live session for ``key``, resuming it (no client attached) when it is not open."""
     sid, s = live_for_key(key)

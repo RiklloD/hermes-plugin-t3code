@@ -217,7 +217,8 @@ function ContextStrip() {
   const lines = []
   const lin = data.lineage || {}
   const queue = data.queue || { items: [] }
-  const armed = (data.recoveries || []).filter(r => r.status === 'armed')
+  const armed = (data.recoveries || []).filter(r => r.status === 'armed' && r.kind !== 'restart')
+  const restarting = (data.recoveries || []).filter(r => r.status === 'armed' && r.kind === 'restart')
   const pendingDelivery = (data.tasks || []).filter(t => t.delivery === 'pending').length
 
   if (data.asChild) {
@@ -268,6 +269,17 @@ function ContextStrip() {
         key: r.id,
         tone: 'warn'
       }, 'Usage limit reached — continues automatically at ', h('b', null, clock(r.reset_at)), ` (in ${until(r.reset_at, now)})`)
+    )
+  }
+
+  for (const r of restarting) {
+    lines.push(
+      h(Line, {
+        actions: h(Btn, { danger: true, label: 'Cancel', onClick: () => act(() => post(`/recoveries/${r.id}/cancel`)) }),
+        icon: '↻',
+        key: r.id,
+        tone: 'info'
+      }, 'Hermes restarted — this turn continues where it left off')
     )
   }
 
@@ -360,7 +372,7 @@ function SettingsPage() {
     h('style', null, CSS),
     h('div', null,
       h('h3', null, 'Recovery & delegation'),
-      toggle('continue_after_restart', 'Continue interrupted turns after a restart', 'Resumes turns and delegated tasks a backend restart cut short, without reopening each chat.'),
+      toggle('continue_after_restart', 'Continue threads after restarts', 'After an update, quit or crash, turns and delegated tasks the restart cut short get “Continue where you left off.”, with a note of background work it cancelled. Not for settled, snoozed or archived chats, chats waiting on your answer, or a turn that restarted 3 times in a row.'),
       toggle('resume_on_usage_limit', 'Resume when a usage limit resets', 'Sends “Continue where you left off.” once the provider limit lifts.'),
       toggle('cross_profile_delegation', 'Allow delegating to other profiles', 'A chat may hand a task to another profile, which runs as itself (its memory, persona, model).'),
       toggle('harness_switch', 'Switch harness inside a chat', 'Pick Claude CLI in a chat that started on another model (or the reverse): the chat continues with a context handoff instead of needing a new chat.')),
@@ -423,6 +435,9 @@ export default {
     for (const name of ['task.updated', 'queue.updated', 'lineage.updated', 'recovery.updated', 'schedules.updated', 'session.stopped', 'session.turn']) {
       ctx.onEvent(EVENT(name), ev => {
         if (name === 'task.updated' && ev?.payload?.taskId) $tasks.set({ ...$tasks.get(), [ev.payload.taskId]: ev.payload })
+        if (name === 'recovery.updated' && ev?.payload?.kind === 'restart' && ev.payload.status === 'fired') {
+          toast(ev.payload.title ? `${ev.payload.summary}: “${ev.payload.title}”` : ev.payload.summary)
+        }
         invalidate()
       })
     }

@@ -83,13 +83,13 @@
     const { data: settings, reload } = usePoll('/settings', 15000)
     const { data: rec } = usePoll('/recoveries', 10000)
     const set = patch => call('/settings', 'POST', patch).then(reload)
-    const armed = ((rec && rec.recoveries) || []).filter(r => r.status === 'armed')
+    const armed = ((rec && rec.recoveries) || []).filter(r => r.status === 'armed' && r.kind !== 'restart')
     const toggle = (k, label) => h('label', { className: 'flex items-center gap-2 text-sm' },
       h('input', { type: 'checkbox', checked: !!(settings && settings[k]), onChange: e => set({ [k]: e.target.checked }) }), label)
     return h(Card, null,
       h(CardHeader, null, h(CardTitle, null, 'Recovery & automation')),
       h(CardContent, { className: 'space-y-2' },
-        toggle('continue_after_restart', 'Continue interrupted turns and delegated tasks after a backend restart'),
+        toggle('continue_after_restart', 'Continue threads after restarts (update, quit or crash)'),
         toggle('resume_on_usage_limit', 'Resume threads automatically when a provider usage limit resets'),
         armed.length ? armed.map(r => h('div', { key: r.id, className: 'text-sm' }, `${r.session_key}: resumes after ${when(r.reset_at)}`))
           : h('p', { className: 'text-sm text-muted-foreground' }, 'No usage-limit resumes armed.')))

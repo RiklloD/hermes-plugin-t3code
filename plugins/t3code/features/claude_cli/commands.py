@@ -55,11 +55,11 @@ def _probe(settings: dict, cwd: str) -> list[dict]:
         return asyncio.run(run(workspace))
 
 
-def slash_commands(cwd: str = "", runtime=None) -> list[dict]:
+def slash_commands(cwd: str = "", runtime=None, *, settings=None) -> list[dict]:
     live = getattr(runtime, "commands", None)
     if live:
         return live
     from t3code_shared import native_commands
-    settings = settings_for_profile()
+    settings = settings_for_profile() if settings is None else settings
     # A cold workspace waits once for Claude Code's handshake; afterwards answers are instant.
     return native_commands.get(PROVIDER, cache_key(settings, cwd), lambda: _probe(settings, cwd), wait=20)

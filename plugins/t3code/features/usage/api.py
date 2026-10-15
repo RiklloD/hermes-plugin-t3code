@@ -30,6 +30,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 from collections import defaultdict
@@ -47,7 +48,6 @@ _native = load_feature_module("usage", "native.py")  # Muse Code + Antigravity
 router = APIRouter()
 
 HOME = Path.home()
-CLAUDE_ROOTS = [Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude") / "projects"]
 CODEX_HOME = Path(os.environ.get("CODEX_HOME") or HOME / ".codex")
 CODEX_ROOTS = [CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions"]
 FORK_COPY_MAX_GAP_MS = 1000
@@ -215,8 +215,10 @@ def _iter_files(roots: Iterable[Path], cutoff_s: float) -> Iterable[Path]:
                     continue
 
 
-def _scan(provider: str, cutoff_s: float) -> List[Record]:
-    roots, parser = (CLAUDE_ROOTS, _parse_claude_file) if provider == "claude" else (CODEX_ROOTS, _parse_codex_file)
+def _scan(provider: str, cutoff_s: float, roots: List[Path] = None) -> List[Record]:
+    if roots is None:
+        roots = _all_claude_roots() if provider == "claude" else CODEX_ROOTS
+    parser = _parse_claude_file if provider == "claude" else _parse_codex_file
     records: List[Record] = []
     for path in _iter_files(roots, cutoff_s):
         try:
@@ -281,6 +283,39 @@ def _hermes_codex_records(cutoff_s: float) -> List[Record]:
     return out
 
 
+# ─── native accounts (resolved per owning profile, never at import time) ───
+def _claude_accounts() -> list[dict]:
+    opts = load_feature_module("claude_cli", "options.py")
+    accounts, seen = [], set()
+    for account in opts.account_definitions():
+        directory = opts.config_directory(account["settings"])
+        if directory in seen:
+            continue
+        seen.add(directory)
+        accounts.append({**account, "directory": str(directory), "root": directory / "projects"})
+    return accounts
+
+
+def _all_claude_roots() -> List[Path]:
+    return [account["root"] for account in _claude_accounts()]
+
+
+def _claude_records_by_account(cutoff: float) -> list[tuple[dict, List[Record]]]:
+    # A copied/forked transcript retains native request IDs: attribute each request only once.
+    seen, out = set(), []
+    for account in _claude_accounts():
+        records = []
+        for record in _scan("claude", cutoff, [account["root"]]):
+            key = record[8]
+            if key is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
+            records.append(record)
+        out.append((account, records))
+    return out
+
+
 # ─── pricing (Hermes' tables) ───────────────────────────────────────────────
 _UNPRICEABLE = {"<synthetic>", "synthetic", "opus", "sonnet", "haiku", "fable"}
 _price_cache: Dict[Tuple[str, str], Optional[Tuple[float, float, float, float]]] = {}
@@ -332,6 +367,27 @@ def _empty_tokens() -> Dict[str, int]:
     return {"uncached": 0, "cached": 0, "cacheWrite": 0, "output": 0, "reasoning": 0}
 
 
+def _account_breakdown(acc_recs: List[Record], cutoff_ms: int) -> Dict[str, Any]:
+    """Aggregate tokens+cost for one account's records."""
+    tok, cost = 0, 0.0
+    empty = _empty_tokens()
+    for r in acc_recs:
+        ts, model, unc, cac, cw, outp, reas, speed, _, _sid = r
+        if ts < cutoff_ms:
+            continue
+        t = unc + cac + cw + outp
+        rates = _rates("claude", model)
+        mult = _SPEED_MULTIPLIER.get(speed, 1.0)
+        c = sum((unc * rates[0], cac * rates[1], cw * rates[2], outp * rates[3])) * mult if rates else 0.0
+        tok += t
+        cost += c
+        empty["uncached"] += unc
+        empty["cached"] += cac
+        empty["cacheWrite"] += cw
+        empty["output"] += outp
+    return {"tokens": tok, "cost": cost, **empty}
+
+
 def _compute(days: int) -> Dict[str, Any]:
     now = time.time()
     hourly = days == 1
@@ -341,8 +397,10 @@ def _compute(days: int) -> Dict[str, Any]:
         cutoff = start.timestamp()
     cutoff_ms = int(cutoff * 1000)
 
+    claude_accounts = _claude_records_by_account(cutoff)
+
     sources = {
-        "claude": [("cli", r) for r in _scan("claude", cutoff)],
+        "claude": [("cli", r) for _, records in claude_accounts for r in records],
         "codex": [("cli", r) for r in _scan("codex", cutoff)] + [("hermes", r) for r in _hermes_codex_records(cutoff)],
         "antigravity": [("cli", r) for r in _native.antigravity_records(cutoff)],
         "muse": [("cli", r) for r in _native.muse_records(cutoff)],
@@ -401,6 +459,11 @@ def _compute(days: int) -> Dict[str, Any]:
         totals["cost"] += p["cost"]
         providers[provider] = {**p, "sessions": len(p["sessions"]), "via": dict(p["via"])}
 
+    providers["claude"]["accounts"] = [
+        {"id": account["id"], "label": account["label"], **_account_breakdown(records, cutoff_ms)}
+        for account, records in claude_accounts
+    ]
+
     # Continuous buckets, oldest → newest, so the chart has a slot per period.
     series = []
     if hourly:
@@ -425,6 +488,7 @@ def _compute(days: int) -> Dict[str, Any]:
         ({**m, "sessions": len(m["sessions"])} for m in models.values()),
         key=lambda m: (-m["cost"], -m["tokens"]))
 
+    all_roots = _all_claude_roots()
     return {
         "days": days,
         "resolution": "hour" if hourly else "day",
@@ -435,7 +499,7 @@ def _compute(days: int) -> Dict[str, Any]:
         "series": series,
         "totals": {**totals, "sessions": sum(p["sessions"] for p in providers.values())},
         "sources": {
-            "claude": [str(p) for p in CLAUDE_ROOTS if p.is_dir()],
+            "claude": [str(p) for p in all_roots if p.is_dir()],
             "codex": [str(p) for p in CODEX_ROOTS if p.is_dir()] + [f"hermes:{n}" for n, _ in _profile_dbs()],
             "antigravity": [str(p) for p in _native.antigravity_roots()],
             "muse": [str(p) for p in _native.muse_roots()],
@@ -466,12 +530,18 @@ def _iso_from_epoch(v: Any) -> Optional[str]:
     return None
 
 
-async def _jsonl_session(argv: List[str], frames: List[dict], want, timeout: float) -> Optional[dict]:
+def _make_limits_env(config_dir: str) -> dict:
+    opts = load_feature_module("claude_cli", "options.py")
+    return opts.subscription_env({"config_directory": config_dir})
+
+
+async def _jsonl_session(argv: List[str], frames: List[dict], want, timeout: float,
+                         env: Optional[dict] = None) -> Optional[dict]:
     """Spawn a JSON-lines CLI, write ``frames`` (re-sent by ``want`` on demand), and
     return the first frame ``want`` accepts."""
     proc = await asyncio.create_subprocess_exec(
         *argv, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL, limit=16 * 1024 * 1024)
+        stderr=asyncio.subprocess.DEVNULL, limit=16 * 1024 * 1024, env=env)
     try:
         async def send(obj: dict) -> None:
             proc.stdin.write((json.dumps(obj) + "\n").encode())
@@ -510,10 +580,28 @@ def _window(id_: str, label: str, kind: str, used: Any, resets_at: Optional[str]
     return {"id": id_, "label": label, "kind": kind, "usedPercent": pct, "resetsAt": resets_at, "windowDurationMins": mins}
 
 
-async def _claude_limits() -> Dict[str, Any]:
-    exe = _which("claude")
-    if not exe:
-        return {"provider": "claude", "status": "unavailable", "message": "Claude Code CLI not found."}
+async def _claude_limits_for_account(account_id: str, account_label: str, config_dir: str, settings=None) -> Dict[str, Any]:
+    """Probe one Claude account for rate-limit windows."""
+    base: Dict[str, Any] = {"provider": "claude", "account_id": account_id, "account_label": account_label}
+    opts = load_feature_module("claude_cli", "options.py")
+    try:
+        exe = opts.executable(settings or {})
+    except FileNotFoundError:
+        return {**base, "status": "unavailable", "message": "Claude Code CLI not found."}
+
+    child_env = opts.subscription_env(settings) if settings is not None else _make_limits_env(config_dir)
+
+    # Quick auth check: unauthenticated accounts return a clean status instead of noisy errors.
+    try:
+        done = await asyncio.to_thread(
+            subprocess.run, [exe, "auth", "status"],
+            capture_output=True, text=True, env=child_env, timeout=5, check=False)
+        auth_info = json.loads(done.stdout)
+        base["account"] = auth_info.get("emailAddress") or auth_info.get("email")
+        if not auth_info.get("loggedIn"):
+            return {**base, "status": "unauthenticated", "message": "Sign in to view limits."}
+    except Exception:
+        pass  # proceed to probe — auth check failure is not fatal
 
     async def want(msg: dict, _send) -> Optional[dict]:
         if msg.get("type") != "control_response":
@@ -525,14 +613,14 @@ async def _claude_limits() -> Dict[str, Any]:
         [exe, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"],
         [{"type": "control_request", "request_id": "t3-init", "request": {"subtype": "initialize"}},
          {"type": "control_request", "request_id": "t3-usage", "request": {"subtype": "get_usage"}}],
-        want, PROBE_TIMEOUT_S)
+        want, PROBE_TIMEOUT_S, env=child_env)
     if not resp or resp.get("subtype") != "success":
-        return {"provider": "claude", "status": "error",
+        return {**base, "status": "error",
                 "message": (resp or {}).get("error") or "Claude Code did not report usage."}
     body = resp.get("response") or {}
     plan = body.get("subscription_type")
     if not body.get("rate_limits_available") or not isinstance(body.get("rate_limits"), dict):
-        return {"provider": "claude", "status": "unsupported", "plan": plan,
+        return {**base, "status": "unsupported", "plan": plan,
                 "message": "This Claude account does not report subscription limits."}
     rl = body["rate_limits"]
     windows = []
@@ -551,7 +639,7 @@ async def _claude_limits() -> Dict[str, Any]:
                                    entry["utilization"], entry.get("resets_at"), 10080))
     extra = rl.get("extra_usage") if isinstance(rl.get("extra_usage"), dict) else None
     return {
-        "provider": "claude", "status": "ok", "plan": plan, "windows": windows,
+        **base, "status": "ok", "plan": plan, "windows": windows,
         "extraUsage": ({"enabled": bool(extra.get("is_enabled")), "usedCredits": extra.get("used_credits"),
                         "monthlyLimit": extra.get("monthly_limit"), "currency": extra.get("currency"),
                         "utilization": extra.get("utilization")} if extra else None),
@@ -616,12 +704,6 @@ async def _codex_limits() -> Dict[str, Any]:
 
 
 # ─── Z.ai GLM Coding Plan ───────────────────────────────────────────────────
-# Hermes only stores the key + base URL (GLM_API_KEY / GLM_BASE_URL, or the
-# ZAI_* pair). The plan's quota lives on the monitor API of the same host:
-#   GET <origin>/api/monitor/usage/quota/limit   (Authorization: ***)
-# TOKENS_LIMIT = the rolling prompt window (unit 3 = hours, number 5 → 5 h);
-# TIME_LIMIT   = monthly MCP tool calls (web search / reader / zread), with
-# usage = quota, currentValue = used.
 _ZAI_UNIT_MINS = {1: 1, 2: 60 * 24 * 7, 3: 60, 4: 60 * 24, 5: 60 * 24 * 30, 6: 60 * 24 * 7}
 
 
@@ -714,7 +796,7 @@ async def _zai_limits() -> Dict[str, Any]:
             "windows": windows}
 
 
-_limits_cache: Dict[str, Any] = {"at": 0.0, "data": None}
+_limits_cache: Dict[str, Any] = {"at": 0.0, "data": None, "cache_key": None}
 _limits_lock = asyncio.Lock()
 
 
@@ -731,12 +813,34 @@ async def _safe(coro, provider: str) -> Dict[str, Any]:
 async def get_limits(refresh: bool = False) -> Dict[str, Any]:
     async with _limits_lock:
         now = time.time()
-        if not refresh and _limits_cache["data"] and now - _limits_cache["at"] < LIMITS_TTL_S:
+        from hermes_constants import get_hermes_home
+        all_accs = _claude_accounts()
+        cache_key = (str(get_hermes_home()), tuple((a["id"], a["directory"]) for a in all_accs))
+        if (not refresh and _limits_cache["data"]
+                and _limits_cache.get("cache_key") == cache_key
+                and now - _limits_cache["at"] < LIMITS_TTL_S):
             return _limits_cache["data"]
-        claude, codex, zai, antigravity, muse = await asyncio.gather(
-            _safe(_claude_limits(), "claude"), _safe(_codex_limits(), "codex"), _safe(_zai_limits(), "zai"),
+
+        async def claude_snapshot(account):
+            result = await _safe(_claude_limits_for_account(
+                account["id"], account["label"], account["directory"], account["settings"]), "claude")
+            return {**result, "account_id": account["id"], "account_label": account["label"]}
+
+        claude_coros = [claude_snapshot(account) for account in all_accs]
+        other_coros = [
+            _safe(_codex_limits(), "codex"),
+            _safe(_zai_limits(), "zai"),
             _safe(asyncio.to_thread(_native.antigravity_limits, _window), "antigravity"),
-            _safe(asyncio.to_thread(_native.muse_limits, _window), "muse"))
-        data = {"checkedAt": int(now * 1000), "providers": [codex, claude, zai, antigravity, muse]}
-        _limits_cache.update(at=now, data=data)
+            _safe(asyncio.to_thread(_native.muse_limits, _window), "muse"),
+        ]
+
+        all_results = await asyncio.gather(*claude_coros, *other_coros)
+        n = len(all_accs)
+        claude_results = list(all_results[:n])
+        codex, zai, antigravity, muse = all_results[n], all_results[n + 1], all_results[n + 2], all_results[n + 3]
+
+        # Preserve original provider order: codex, claude(s), zai, antigravity, muse
+        providers = [codex] + claude_results + [zai, antigravity, muse]
+        data = {"checkedAt": int(now * 1000), "providers": providers}
+        _limits_cache.update(at=now, data=data, cache_key=cache_key)
         return data

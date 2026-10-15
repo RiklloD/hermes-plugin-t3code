@@ -16,9 +16,10 @@ Feature map (T3 Code orchestration V2 → Hermes):
 * Steer or queue — a durable per-session queue (edit, reorder, remove, promote to steer)
   that survives restarts and drains when the session is idle; steering uses Hermes's
   in-turn steer, restart uses redirect.
-* Recovery and automation — optional proactive continuation after backend restarts,
-  automatic resume when a provider usage limit resets, and scheduled tasks (interval,
-  fixed time, webhook) bound to a session or launching fresh ones.
+* Recovery and automation — continuation after backend restarts (update, quit or crash;
+  T3's RestartContinuation, policy in ``restart.py``), automatic resume when a provider usage
+  limit resets, and scheduled tasks (interval, fixed time, webhook) bound to a session or
+  launching fresh ones.
 """
 
 from __future__ import annotations
@@ -28,23 +29,24 @@ import fcntl
 import json
 import logging
 import queue
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
 
-from . import chatframe, gw, handoff, harness, schedule as sched
+from . import chatframe, gw, handoff, harness, restart, schedule as sched
 from .store import TERMINAL, Store, dumps, loads, new_id
 
 # Native runtimes that fork their own session (Claude CLI: fork_session; Muse Code: session/fork).
 # Antigravity's ACP agent has no fork, so its forks carry a portable handoff like any native target.
-NATIVE_FORK_PROVIDERS = ("claude-cli", "muse-code")
+NATIVE_FORK_PROVIDERS = ("claude-cli", "claude-cli-2", "muse-code")
 logger = logging.getLogger("t3o.engine")
 
 # Desktop events go out as ``plugin.t3code.orchestrator.<event>`` (one plugin, one namespace per feature).
 PLUGIN_ID = "t3code"
 EVENT_PREFIX = "orchestrator."
-CONTINUE_PROMPT = "Continue where you left off."
+CONTINUE_PROMPT = restart.CONTINUE_PROMPT
 CARD = "async_delegation_complete"  # Desktop renders this kind as a compact completion card
 ROLES = ("implementation", "research", "review", "design", "test", "general")
 _ROLE_HINT = {
@@ -99,6 +101,10 @@ class Engine:
         self._dispatch_lock = threading.RLock()  # serializes claim → dispatch against Stop / cancel
         self._backoff: dict[str, float] = {}
         self._fails: dict[str, int] = {}
+        self._live_written: dict[str, str] = {}  # session key → signature of this process's live_work row
+        self._last_live = 0.0
+        self._shutting_down = False
+        self._identity: Optional[tuple[int, Optional[float]]] = None
         self.webhooks = sched.WebhookListener(self._on_webhook)
 
     # ── lifecycle ───────────────────────────────────────────────────────────
@@ -158,6 +164,8 @@ class Engine:
         chatframe.install(self)  # children live in the native in-chat Subagents frame
         harness.install_switch_wrap()  # Hermes model <-> Claude CLI in the same thread
         harness.install_runtime_wrap()
+        # T3 prepareForShutdown: capture restart intent before core's exit path interrupts the turns.
+        gw.wrap_global("_stop_turns_before_exit", self.prepare_for_shutdown)
         logger.info("t3code orchestrator engine attached (owner=%s)", self._claim_owner())
         while True:
             try:
@@ -173,6 +181,12 @@ class Engine:
                 pass
             except Exception:
                 logger.warning("t3o event handling failed", exc_info=True)
+            if _now() - self._last_live >= 2.0:
+                self._last_live = _now()
+                try:
+                    self._record_live_work()
+                except Exception:
+                    logger.debug("t3o live-work snapshot failed", exc_info=True)
             if _now() - self._last_tick >= 2.0:
                 self._last_tick = _now()
                 try:
@@ -181,7 +195,8 @@ class Engine:
                     logger.warning("t3o tick failed", exc_info=True)
 
     def _tap(self, kind: str, sid: str, payload: dict) -> None:
-        if self._paused:
+        # Once shutdown starts, core interrupts every turn: those frames are the restart, not outcomes.
+        if self._paused or self._shutting_down:
             return
         if kind in ("message.start", "message.complete", "tool.start", "tool.complete", "message.delta",
                     "todo.updated", "error", "session.title"):
@@ -198,6 +213,8 @@ class Engine:
 
     # ── event handling ──────────────────────────────────────────────────────
     def _handle(self, kind: str, sid: str, payload: dict) -> None:
+        if self._shutting_down:
+            return
         key, profile = self._key_of_sid(sid)
         if not key:
             return
@@ -853,7 +870,7 @@ class Engine:
             strategy = "native_provider_fork"
             new_key, new_sid = self._create_seeded(visible, name, source_key, profile, tgt_provider, tgt_model,
                                                    cwd=native.get("cwd"))
-            fork_at = self._native_fork_point(native) if tgt_provider == "claude-cli" else None
+            fork_at = self._native_fork_point(native) if tgt_provider in ("claude-cli", "claude-cli-2") else None
             point["nativeForkAt"] = fork_at
             db = gw.open_db(profile, write=True)
             try:
@@ -1198,26 +1215,14 @@ class Engine:
                 if t["status"] in ("starting", "running") and t["started_at"] and t["started_at"] < self._started_at:
                     self._finalize(t, {"status": "interrupted", "error": "The Hermes backend restarted before the task finished "
                                                                           "(continue-after-restart is off)."})
+            self.store.execute("UPDATE recoveries SET status = 'disabled' WHERE kind = 'restart' AND status = 'armed'")
             return
-        from tui_gateway.turn_marker import _load, _marker_path, marker_writer_state
-        resumed: set[str] = set()
-        for profile, home in self._profiles():
-            try:
-                markers = _load(_marker_path(home))
-            except Exception:
-                continue
-            for key, entry in list(markers.items()):
-                if not isinstance(entry, dict) or marker_writer_state(entry) == "alive":
-                    continue
-                if _now() - float(entry.get("started_at") or 0) > 6 * 3600:
-                    continue
-                try:
-                    self._continue_after_restart(key, profile)
-                    resumed.add(key)
-                except Exception:
-                    logger.info("t3o: restart continuation skipped for %s", key, exc_info=True)
+        self._collect_cut_turns(markers=True)
+        # Children with restart intent are continued (or settled) by _fire_restarts.
+        covered = {r["session_key"] for r in self.store.rows(
+            "SELECT session_key FROM recoveries WHERE kind = 'restart' AND status = 'armed'")}
         for t in self.store.active_tasks():
-            if t["status"] not in ("starting", "running") or not t["child_key"] or t["child_key"] in resumed:
+            if t["status"] not in ("starting", "running") or not t["child_key"] or t["child_key"] in covered:
                 continue
             if t["started_at"] and t["started_at"] >= self._started_at:
                 continue
@@ -1230,16 +1235,272 @@ class Engine:
                 self._finalize(t, {"status": "interrupted", "error": f"The Hermes backend restarted and the task could not "
                                                                      f"be continued: {exc}"})
 
-    def _continue_after_restart(self, key: str, profile: Optional[str]) -> None:
-        sid, s = self.ensure_live(key, profile)
-        self.store.log("restart.continue", key)
-        provider, _, native = self._source_route(key, profile)
-        if native.get("session_id") or self._is_native_provider(provider):
-            # Core leaves native-runtime recovery to the native session; prompt it to continue.
-            from tui_gateway.turn_marker import clear_turn_marker
-            clear_turn_marker(gw.profile_home(profile), key)
-            self._deliver(key, sid, s, CONTINUE_PROMPT, display_kind="auto_continue")
-        # Hermes-loop sessions: session.resume ran core's bounded auto-continue (fresh marker, attempt cap).
+    # ── restart continuation (T3's "Continue threads after restarts") ───────
+    # Intent is a ``recoveries`` row (kind 'restart', reset_at = when the turn was cut) whose detail
+    # carries the cut turn: running or settled-with-awaited-work, prompt, runtime, background work,
+    # and whether the user had stopped it or owed it an answer. Recorded by prepare_for_shutdown
+    # (update / quit) or from what a dead process left behind (crash); delivered by _fire_restarts.
+    def _me(self) -> tuple[int, Optional[float]]:
+        if self._identity is None:
+            self._identity = restart.own_identity()
+        return self._identity
+
+    def _background_work(self, key: str, session: dict) -> list[dict]:
+        """Work a restart kills that the turn may be waiting on: native subagents and background
+        processes. Orchestrator tasks are not listed: their own threads continue and report back."""
+        work: list[dict] = []
+        for n in list(chatframe.NATIVE.values()):
+            if n.get("parent_key") == key and n.get("status") in ("queued", "running"):
+                work.append({"kind": "subagent", "label": restart.compact_label(n.get("goal")) or "subagent", "id": n["id"]})
+        registry = getattr(sys.modules.get("tools.process_registry"), "process_registry", None)
+        ids = {str(session.get("session_key") or ""), gw._agent_key(session)} - {""}
+        if registry is not None and ids:
+            with contextlib.suppress(Exception):
+                with registry._lock:
+                    procs = list(registry._running.values())
+                for p in procs:
+                    if p.exited or not ({p.session_key, p.task_id, getattr(p, "owner_task_id", "")} & ids):
+                        continue
+                    awaited = bool(p.notify_on_complete or p.watch_patterns)
+                    work.append({"kind": "task" if awaited else "shell", "id": p.id, "pid": p.pid,
+                                 "label": restart.compact_label(p.command) or "background command"})
+        return work
+
+    def _live_entries(self) -> dict[str, dict]:
+        """This process's running turns, and idle threads waiting on background work, by lineage root."""
+        out: dict[str, dict] = {}
+        registry = getattr(sys.modules.get("tools.process_registry"), "process_registry", None)
+        background = bool(chatframe.NATIVE) or bool(getattr(registry, "_running", None))
+        for sid, s in gw.sessions_snapshot():
+            if s.get("_finalized") or s.get("_closing"):
+                continue
+            running = gw.is_running(s)
+            if not running and not background:
+                continue
+            key, profile = self._key_of_sid(sid)
+            if not key:
+                continue
+            work = self._background_work(key, s)
+            if not running and not any(restart.is_awaited(w) for w in work):
+                continue
+            inflight = s.get("inflight_turn") if isinstance(s.get("inflight_turn"), dict) else {}
+            provider = str(getattr(s.get("agent"), "provider", "") or s.get("provider") or "")
+            out[key] = {"profile": profile, "running": running, "prompt": _clip(inflight.get("user") or "", 4000),
+                        "provider": provider, "native": self._is_native_provider(provider),
+                        "turn_started_at": (self.store.turn(key) or {}).get("started_at"),
+                        "stopping": gw.stop_latched(s), "awaiting_user": gw.awaiting_user(sid, s), "work": work}
+        return out
+
+    def _record_live_work(self) -> None:
+        """Keep this process's ``live_work`` rows current; rows a dead process leaves are a crash."""
+        if self._paused or self._shutting_down or not gw.is_serve_process():
+            return
+        pid, start = self._me()
+        entries = self._live_entries() if self.store.setting("continue_after_restart") else {}
+        for key, d in entries.items():
+            sig = dumps([d["running"], d["prompt"], d["stopping"], d["awaiting_user"], [w["id"] for w in d["work"]]])
+            if self._live_written.get(key) == sig:
+                continue
+            self.store.execute(
+                "INSERT INTO live_work (session_key, profile, pid, pid_start, detail, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(session_key) DO UPDATE SET profile = excluded.profile, pid = excluded.pid, "
+                "pid_start = excluded.pid_start, detail = excluded.detail, updated_at = excluded.updated_at",
+                (key, d["profile"], pid, start, dumps(d), _now()))
+            self._live_written[key] = sig
+        for key in [k for k in self._live_written if k not in entries]:
+            self.store.execute("DELETE FROM live_work WHERE session_key = ? AND pid = ?", (key, pid))
+            self._live_written.pop(key, None)
+
+    def prepare_for_shutdown(self) -> int:
+        """T3 prepareForShutdown: record intent for every live turn while it is still live. Runs from
+        core's exit path right before it interrupts the turns (signal handler or atexit, once)."""
+        if self._shutting_down:
+            return 0
+        self._shutting_down = True
+        if self._paused or not gw.is_serve_process() or not self.store.setting("continue_after_restart"):
+            return 0
+        entries = self._live_entries()
+        for key, d in entries.items():
+            # One failing thread must not cost the threads after it their continuation.
+            with contextlib.suppress(Exception):
+                self._record_intent(key, d["profile"], {**d, "cause": "shutdown"}, _now())
+        self.store.execute("DELETE FROM live_work WHERE pid = ?", (self._me()[0],))
+        self.store.log("restart.prepared", "", {"threads": len(entries)})
+        return len(entries)
+
+    def _record_intent(self, key: str, profile: Optional[str], detail: dict, cut_at: float) -> None:
+        existing = self.store.row("SELECT * FROM recoveries WHERE session_key = ? AND kind = 'restart' AND status = 'armed'",
+                                  (key,))
+        if existing is not None:
+            prior = loads(existing["detail"], {}) or {}
+            merged = {**detail, **prior, "work": restart.merge_work(prior.get("work") or [], detail.get("work") or []),
+                      "marker": bool(prior.get("marker") or detail.get("marker"))}
+            for k in ("marker_key", "marker_attempts"):
+                if detail.get(k) is not None:
+                    merged[k] = detail[k]
+            self.store.update("recoveries", existing["id"], {"detail": dumps(merged)})
+            return
+        self.store.execute("INSERT OR IGNORE INTO recoveries (id, session_key, profile, kind, reset_at, status, detail, "
+                           "created_at) VALUES (?, ?, ?, 'restart', ?, 'armed', ?, ?)",
+                           (new_id("rec"), key, profile, cut_at, dumps(detail), _now()))
+        self.store.log("restart.recorded", key, {"cause": detail.get("cause"), "running": detail.get("running")})
+
+    def _collect_cut_turns(self, *, markers: bool = False) -> None:
+        """Turn what dead processes left behind into restart intent: their ``live_work`` rows and,
+        at boot, core's crash markers (a turn started too recently for the snapshot)."""
+        me = self._me()
+        for r in self.store.rows("SELECT * FROM live_work"):
+            if (r["pid"], r["pid_start"]) == me:
+                continue
+            same_pid_old = r["pid"] == me[0] and r["pid_start"] != me[1]
+            if not same_pid_old and not restart.writer_dead(r["pid"], r["pid_start"]):
+                continue
+            d = loads(r["detail"], {}) or {}
+            with contextlib.suppress(Exception):
+                self._record_intent(r["session_key"], r["profile"], {**d, "cause": "crash"}, float(r["updated_at"]))
+            self.store.execute("DELETE FROM live_work WHERE session_key = ? AND pid = ?", (r["session_key"], r["pid"]))
+        if not markers:
+            return
+        try:
+            from tui_gateway.turn_marker import _load, _marker_path, marker_writer_state
+        except Exception:
+            return
+        for profile, home in self._profiles():
+            try:
+                entries = _load(_marker_path(home))
+            except Exception:
+                continue
+            for mkey, entry in list(entries.items()):
+                if not isinstance(entry, dict) or marker_writer_state(entry) == "alive":
+                    continue
+                if not entry.get("auto_continue", True):
+                    continue  # the mailbox owns recovery for imported turns
+                started = float(entry.get("started_at") or 0)
+                if _now() - started > restart.MAX_INTENT_AGE_S:
+                    continue
+                with contextlib.suppress(Exception):
+                    key = self.root(mkey, profile)
+                    provider, _, native = self._source_route(key, profile)
+                    self._record_intent(key, profile, {
+                        "cause": "crash", "running": True, "prompt": _clip(entry.get("prompt") or "", 4000),
+                        "provider": provider, "native": bool(native.get("session_id")) or self._is_native_provider(provider),
+                        "turn_started_at": started, "work": [], "marker": True, "marker_key": mkey,
+                        "marker_attempts": int(entry.get("attempts") or 0), "profile": profile}, started)
+
+    def _restart_chain(self, key: str) -> int:
+        """Consecutive automatic continuations since the last turn a person (or the queue) started."""
+        since = (self.store.turn(key) or {}).get("last_user_at") or 0
+        r = self.store.row("SELECT COUNT(*) AS n FROM recoveries WHERE session_key = ? AND kind = 'restart' "
+                           "AND status = 'fired' AND fired_at > ?", (key, since))
+        return int((r or {}).get("n") or 0)
+
+    def _fire_restarts(self) -> None:
+        for r in self.store.rows("SELECT * FROM recoveries WHERE kind = 'restart' AND status = 'armed' ORDER BY created_at"):
+            try:
+                status = self._continue_restarted(r)
+            except Exception:
+                logger.info("t3o: restart continuation failed for %s", r["session_key"], exc_info=True)
+                status = None
+            if status is None:
+                if _now() - r["created_at"] <= restart.MAX_INTENT_AGE_S:
+                    continue  # not reachable or busy yet: the next tick tries again
+                status = "expired"
+            self._settle_restart(r, status)
+
+    def _continue_restarted(self, r: dict) -> Optional[str]:
+        """T3 continueRestartedRun. Returns the outcome, or None to retry on a later tick."""
+        if not self.store.setting("continue_after_restart"):
+            return "disabled"
+        key, profile = r["session_key"], r["profile"]
+        d = loads(r["detail"], {}) or {}
+        cut_at = float(r["reset_at"] or r["created_at"])
+        turn = self.store.turn(key) or {}
+        # A user submission after the restart takes precedence over an automatic prompt.
+        if (turn.get("last_user_at") or 0) > cut_at:
+            return "superseded"
+        # The user asked this turn to stop before the restart cut it.
+        if self.store.hold(key) or d.get("stopping"):
+            return "stopped"
+        # A crash snapshot lags up to one tick: a turn that concluded in that window is done.
+        if (d.get("cause") == "crash" and d.get("running") and not d.get("marker") and turn.get("status") != "running"
+                and (turn.get("ended_at") or 0) >= (d.get("turn_started_at") or float("inf"))):
+            return "finished"
+        row: dict = {}
+        with contextlib.suppress(Exception):
+            row = gw.session_row(key, profile) or {}
+        why = restart.blocked(lifecycle=restart.lifecycle_record(self._pname(profile), key),
+                              archived=bool(row.get("archived")), awaiting_user=bool(d.get("awaiting_user")))
+        if why:
+            return why
+        if restart.is_maintenance_command(d.get("prompt")):
+            return "maintenance"
+        # A turn that keeps killing the backend would otherwise restart it forever.
+        if self._restart_chain(key) >= restart.MAX_CONTINUATION_CHAIN:
+            logger.warning("t3o: not continuing %s, restarted %d times in a row", key, restart.MAX_CONTINUATION_CHAIN)
+            return "exhausted"
+        # Background processes that outlived the backend (their own process group) still report back.
+        work = [w for w in d.get("work") or [] if not (w.get("pid") and restart.pid_alive(w["pid"]))]
+        settled = not d.get("running")
+        if settled and not any(restart.is_awaited(w) for w in work):
+            if work:
+                self._restart_note_next_message(key, profile, work)
+            return "nothing"
+        native = bool(d.get("native"))
+        if d.get("marker") and not native and not work:
+            # Hermes-loop crash: session.resume runs core's own bounded auto-continue (its note carries the prompt).
+            sid, s = self.ensure_live(key, profile)
+            if s.get("_auto_continue_scheduled") or gw.is_running(s):
+                return "fired"
+            srv = gw.server()
+            with contextlib.suppress(Exception):
+                if int(d.get("marker_attempts") or 0) >= int(srv._auto_continue_config()[2]):
+                    return "exhausted"
+        if d.get("marker_key"):
+            # Ours to continue: core must not replay it too when the session is opened.
+            with contextlib.suppress(Exception):
+                from tui_gateway.turn_marker import clear_turn_marker
+                clear_turn_marker(gw.profile_home(profile), d["marker_key"])
+        sid, s = self._idle_session(key, profile)
+        if sid is None:
+            return None
+        text = restart.continuation_text(work, settled)
+        if d.get("cause") == "crash" and not native and not settled and d.get("prompt"):
+            # A hard crash may have persisted nothing of the turn; carry the request like core does.
+            srv = gw.server()
+            note = None
+            with contextlib.suppress(Exception):
+                note = srv._auto_continue_note(d["prompt"])
+            text = (f"{restart.background_note(work)}\n\n{note}" if work else note) if note else text
+        return "fired" if self._deliver(key, sid, s, text, display_kind="auto_continue") else None
+
+    def _restart_note_next_message(self, key: str, profile: Optional[str], work: list[dict]) -> None:
+        """Shells nobody waits on: tell the agent with the next message instead of waking the thread."""
+        self.store.insert("transfers", {
+            "id": new_id("xfer"), "type": "restart_note", "source_key": key, "target_key": key, "profile": profile,
+            "strategy": "note", "status": "pending", "delivery": "next_message", "handoff": restart.background_note(work),
+            "created_by": "system", "created_at": _now()})
+
+    def _settle_restart(self, r: dict, status: str) -> None:
+        values: dict = {"status": status}
+        if status == "fired":
+            values.update(fired_at=_now(), attempts=int(r.get("attempts") or 0) + 1)
+        if not self.store.update("recoveries", r["id"], values, where="status = 'armed'"):
+            return
+        key = r["session_key"]
+        d = loads(r["detail"], {}) or {}
+        self.store.log("restart.continue", key, {"status": status, "cause": d.get("cause")})
+        if status != "fired":
+            # A delegated child that will not continue still owes its parent a result (T3 recoverDelegatedTask).
+            t = self.store.task_for_child(key)
+            if t and t["status"] in ("starting", "running", "waiting_children") and (t["started_at"] or 0) < self._started_at:
+                self._finalize(t, {"status": "interrupted", "error": f"The Hermes backend restarted and the task was not "
+                                                                     f"continued ({status.replace('_', ' ')})."})
+        title = ""
+        with contextlib.suppress(Exception):
+            title = str((gw.session_row(key, r["profile"]) or {}).get("title") or "")
+        summary = restart.SUMMARY_STOPPED if d.get("running") is False else restart.SUMMARY_RESUMED
+        self.broadcast("recovery.updated", {"session_key": key, "kind": "restart", "status": status,
+                                            "title": title, "summary": summary})
 
     # ── schedules ───────────────────────────────────────────────────────────
     def schedule_create(self, args: dict, *, bind_key: Optional[str], profile: Optional[str],
@@ -1382,6 +1643,7 @@ class Engine:
             if self.store.row("SELECT 1 AS x FROM schedules WHERE webhook_token IS NOT NULL AND enabled = 1"):
                 self.webhooks.ensure(int(self.store.setting("webhook_port")))
         self._process_cancels()
+        self._fire_restarts()
         self._drain_queues()
         self._deliver_results()
         self._deliver_transfers_now()
@@ -1390,6 +1652,8 @@ class Engine:
         if _now() - self._last_reconcile > 30:
             self._last_reconcile = _now()
             self._reconcile()
+            if self.store.setting("continue_after_restart"):
+                self._collect_cut_turns()  # a sibling backend that died since boot
 
     def _idle_session(self, key: str, profile: Optional[str]) -> tuple[Optional[str], Optional[dict]]:
         sid, s = self.live_session(key)

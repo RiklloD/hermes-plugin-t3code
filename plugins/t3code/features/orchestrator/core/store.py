@@ -144,6 +144,17 @@ CREATE TABLE IF NOT EXISTS turns (
   model TEXT
 );
 
+-- What each backend process is working on right now (running turns, awaited background work).
+-- Refreshed while it runs; rows a dead process left behind are what a crash cut (restart.py).
+CREATE TABLE IF NOT EXISTS live_work (
+  session_key TEXT PRIMARY KEY,
+  profile TEXT,
+  pid INTEGER NOT NULL,
+  pid_start REAL,
+  detail TEXT NOT NULL,
+  updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -159,7 +170,8 @@ CREATE TABLE IF NOT EXISTS log (
 """
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    # Proactively resume turns a backend restart cut short (core only does it when a chat is reopened).
+    # Proactively resume turns a backend restart (update, quit or crash) cut short, T3's "Continue threads
+    # after restarts" (core only does it for crashes, when a chat is reopened).
     "continue_after_restart": True,
     # Send "Continue where you left off." once a provider's usage limit resets.
     "resume_on_usage_limit": True,

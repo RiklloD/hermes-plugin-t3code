@@ -22,11 +22,9 @@ For a versioned model with native 1M context, the regular picker row uses its fu
 
 After updating the Python feature, restart the Hermes backend to load it; the generated desktop half hot-reloads independently. No account credentials, global Claude settings or unrelated profile configurations are changed by a context selection.
 
-## Background updates
+## Two native accounts
 
-Native Monitor events, background commands and subagent follow-up replies continue streaming after the initial answer. You do not need to send “ok” or another message to receive each update. They use the existing Hermes turn, tool and permission UI and are saved in the display history; the bridge does not send a synthetic follow-up prompt to Claude.
-
-Stop holds automatic delivery until your next message. Replies already produced by Claude remain queued rather than being discarded. Updating this Python bridge requires a backend restart; it does not change an already-running Claude process.
+Sign in to the second account with `CLAUDE_CONFIG_DIR="$HOME/.claude-account2" claude auth login --claudeai`. Keep the first account signed in. After fully quitting and reopening Hermes, select **Claude CLI 2** in a **new chat** for the second subscription; **Claude CLI** retains the original account. Both support native tools, model discovery, context selection and account-bound resume. The **Claude** status menu shows each login; **Usage** shows separate account totals and subscription limits. There is no proxy or automatic routing. `claude_second_config_directory` optionally overrides the second directory.
 
 ## Settings
 
@@ -61,5 +59,15 @@ Native settings, CLAUDE.md, hooks, skills and configured MCP servers are handled
 - Usage comes from native result messages. Native USD totals are not reported as subscription charges.
 - `plugins.isolation: host` is not supported for session-owned runtimes. The plugin runs in-process and owns one separate Claude process per active conversation.
 - Desktop JSON-RPC and picker integration have been exercised with the real CLI. The packaged Electron window has not been visually tested or activated in the user's normal installation.
+
+## Development
+
+With patched Hermes and this plugin's declared SDK dependency available in the interpreter:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+Host contract/regression tests live in the host patch under `tests/agent/test_native_runtime.py`; run them with Hermes's canonical `scripts/run_tests.sh`. See the bundle's `VALIDATION.md` for actual live checks and receipts.
 
 The design follows T3 Code's official-SDK/native-executable architecture. See `THIRD_PARTY_NOTICES.md` for the inspected upstream revision and license attribution.

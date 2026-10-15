@@ -39,7 +39,10 @@ def _status() -> str:
     lines = [f"Active tasks: {len(active)}"]
     for t in active[:12]:
         lines.append(f"  • {t['id']} [{t['status']}] {t['title']} — {t['provider']}/{t['model']}")
-    recs = [r for r in eng.recoveries() if r["status"] == "armed"]
+    recs = [r for r in eng.recoveries() if r["status"] == "armed" and r["kind"] != "restart"]
+    restarts = [r for r in eng.recoveries() if r["kind"] == "restart" and r["status"] in ("armed", "fired")]
+    if restarts:
+        lines.append(f"Restart continuations (24h): {len(restarts)}")
     lines.append(f"Usage-limit resumes armed: {len(recs)}")
     for r in recs[:6]:
         lines.append(f"  • {r['session_key']} resumes {_when(r['reset_at'])}")

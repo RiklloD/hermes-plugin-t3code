@@ -5,13 +5,11 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
-import subprocess
 import tempfile
 import threading
 import time
-from pathlib import Path
 
-from .options import executable, native_options, settings_for_profile
+from .options import native_options, settings_for_profile, settings_for_account2, account_status
 from .model_selection import model_rows
 
 _cache: dict = {}
@@ -19,27 +17,11 @@ _lock = threading.Lock()
 
 
 def setup_status() -> dict:
-    settings = settings_for_profile()
-    try:
-        binary = executable(settings)
-    except FileNotFoundError as exc:
-        return {"available": False, "logged_in": False, "detail": str(exc), "login_command": "claude auth login"}
-    from tools.environments.local import hermes_subprocess_env
-    env = hermes_subprocess_env(inherit_credentials=True)
-    if settings.get("config_directory"):
-        env["CLAUDE_CONFIG_DIR"] = str(Path(settings["config_directory"]).expanduser().resolve())
-    try:
-        done = subprocess.run([binary, "auth", "status"], capture_output=True, text=True, env=env, timeout=10, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"available": True, "logged_in": False, "detail": str(exc), "login_command": "claude auth login"}
-    try:
-        info = json.loads(done.stdout)
-    except ValueError:
-        info = {}
-    logged_in = bool(info.get("loggedIn"))
-    return {"available": True, "logged_in": logged_in, "plan": info.get("subscriptionType", ""),
-            "detail": "Native Claude login" if logged_in else "Run claude auth login before selecting this runtime.",
-            "login_command": "claude auth login"}
+    return account_status(settings_for_profile())
+
+
+def setup_status_account2() -> dict:
+    return account_status(settings_for_account2())
 
 
 async def _probe(settings, environment, timeout):
@@ -52,10 +34,11 @@ async def _probe(settings, environment, timeout):
                 return model_rows(info.get("models", []))
 
 
-def discover_models(*, timeout=25):
+def discover_models(*, timeout=25, settings=None):
     from hermes_constants import get_hermes_home
     from tools.environments.local import hermes_subprocess_env
-    settings = settings_for_profile()
+    if settings is None:
+        settings = settings_for_profile()
     key = (str(get_hermes_home()), json.dumps(settings, sort_keys=True))
     with _lock:
         prior = _cache.get(key)

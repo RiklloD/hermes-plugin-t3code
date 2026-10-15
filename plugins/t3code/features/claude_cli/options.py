@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+ACCOUNT2_DEFAULT_CONFIG_DIR = "~/.claude-account2"
+
 
 def settings_for_profile() -> dict:
     """``plugins.entries.t3code.settings.claude_<key>`` (T3 Code), over the pre-merge
@@ -15,6 +17,83 @@ def settings_for_profile() -> dict:
     t3code = ((entries.get("t3code") or {}).get("settings")) or {}
     current = {k[len("claude_"):]: v for k, v in t3code.items() if k.startswith("claude_") and k != "claude_cli"}
     return {**legacy, **current}
+
+
+def settings_for_account2() -> dict:
+    """Settings for the second Claude account.
+
+    Inherits all settings from account 1 except ``config_directory``, which is taken
+    from ``claude_second_config_directory`` and defaults to ~/.claude-account2."""
+    from hermes_cli.config import load_config_readonly
+    base = settings_for_profile()
+    t3code = (((load_config_readonly() or {}).get("plugins") or {}).get("entries") or {}).get("t3code") or {}
+    raw = t3code.get("settings") or {}
+    second_dir = str(raw.get("claude_second_config_directory") or "").strip()
+    if not second_dir:
+        second_dir = ACCOUNT2_DEFAULT_CONFIG_DIR
+    return {**base, "config_directory": second_dir}
+
+
+def account_definitions() -> list[dict]:
+    """One profile-scoped source for runtime, status and usage account identities."""
+    return [
+        {"id": "claude-cli", "label": "Account A", "settings": settings_for_profile()},
+        {"id": "claude-cli-2", "label": "Account B", "settings": settings_for_account2()},
+    ]
+
+
+def config_directory(settings: dict) -> Path:
+    import os
+    return Path(settings.get("config_directory") or os.environ.get("CLAUDE_CONFIG_DIR")
+                or Path.home() / ".claude").expanduser().resolve()
+
+
+def subscription_env(settings: dict) -> dict:
+    """Use the owning Hermes profile's child environment, never another account's token."""
+    from tools.environments.local import hermes_subprocess_env
+    env = hermes_subprocess_env(inherit_credentials=False)
+    # On macOS, explicitly setting the default path can select a different Keychain
+    # namespace from an unset CLAUDE_CONFIG_DIR. Preserve the original default login.
+    if settings.get("config_directory"):
+        env["CLAUDE_CONFIG_DIR"] = str(config_directory(settings))
+    env.pop("CLAUDECODE", None)
+    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                "CLAUDE_CODE_USE_FOUNDRY"):
+        env.pop(key, None)
+    return env
+
+
+def login_command(settings: dict) -> str:
+    import shlex
+    prefix = f"CLAUDE_CONFIG_DIR={shlex.quote(str(config_directory(settings)))} " if settings.get("config_directory") else ""
+    return f"{prefix}{shlex.quote(str(settings.get('executable') or 'claude'))} auth login --claudeai"
+
+
+def account_status(settings: dict) -> dict:
+    """Only safe CLI-reported identity metadata leaves the native authentication boundary."""
+    import subprocess
+    command = login_command(settings)
+    try:
+        binary = executable(settings)
+    except FileNotFoundError as exc:
+        return {"available": False, "logged_in": False, "detail": str(exc), "login_command": command}
+    try:
+        done = subprocess.run([binary, "auth", "status"], capture_output=True, text=True,
+                              env=subscription_env(settings), timeout=10, check=False)
+        info = json.loads(done.stdout)
+        if not isinstance(info, dict):
+            info = {}
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {"available": True, "logged_in": False, "detail": "Claude login status unavailable.",
+                "login_command": command}
+    logged_in = bool(info.get("loggedIn"))
+    return {"available": True, "logged_in": logged_in,
+            "plan": str(info.get("subscriptionType") or ""),
+            "email": str(info.get("emailAddress") or info.get("email") or ""),
+            "detail": "Native Claude login" if logged_in else "Sign in to use this account.",
+            "login_command": command}
 
 
 def executable(settings: dict) -> str:
@@ -40,9 +119,11 @@ def native_options(settings: dict, environment: dict, cwd: str, state: dict, *, 
     if config_dir:
         env["CLAUDE_CONFIG_DIR"] = str(Path(config_dir).expanduser().resolve())
     # Native login stays native. A profile's API credentials must not override subscription routing by accident.
+    # CLAUDE_CODE_OAUTH_TOKEN is also cleared: accounts must not share an inherited OAuth token.
     if settings.get("auth_mode", "subscription") == "subscription":
         for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-                    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"):
+                    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+                    "CLAUDE_CODE_OAUTH_TOKEN"):
             env[key] = ""
     permission_mode = str(settings.get("permission_mode") or "default")
     if settings.get("auth_mode", "subscription") not in {"subscription", "native"}:
