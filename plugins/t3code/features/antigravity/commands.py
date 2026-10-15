@@ -13,6 +13,7 @@ KEY = "acp"
 DEFAULT = [
     {"name": "plan", "description": "Plan carefully before executing a task (generates an implementation plan "
                                     "artifact and awaits user approval)."},
+    {"name": "compact", "description": "Compact Antigravity's conversation context now"},
     {"name": "logout", "description": "Sign out of Antigravity"},
 ]
 
