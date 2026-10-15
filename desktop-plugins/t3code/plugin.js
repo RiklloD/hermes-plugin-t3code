@@ -3,7 +3,7 @@
 
 // shared/desktop/shell.js
 import * as sdk5 from "@hermes/plugin-sdk";
-import React6 from "react";
+import React7 from "react";
 
 // features/inbox/desktop.js
 import * as sdk from "@hermes/plugin-sdk";
@@ -4952,9 +4952,194 @@ var desktop_default4 = {
   }
 };
 
-// shared/desktop/isolation.js
+// features/goals/desktop.js
 import React5 from "react";
+import { host as host6, useValue as useValue5, useQuery as useQuery5, queryClient as queryClient5, COMPOSER_AREAS as COMPOSER_AREAS3, Tip as Tip4 } from "@hermes/plugin-sdk";
+
+// features/goals/legacy.js
+import { host as host5 } from "@hermes/plugin-sdk";
+var cache = /* @__PURE__ */ new Map();
+function confirmedNativeGoal(rows, initial = null) {
+  let goal = initial, command = null;
+  for (const row of rows) {
+    if (row.display_kind === "hidden") continue;
+    const text = String(row.content || "").trim();
+    if (row.role === "user") {
+      const match = text.match(/^\/(?:claude:)?goal(?:\s+([\s\S]*))?$/);
+      command = match ? String(match[1] || "").trim() : null;
+    } else if (row.role === "assistant" && command !== null) {
+      const objective = command.startsWith("set ") ? command.slice(4).trim() : command;
+      if (text.startsWith("Goal set: ") && text.slice(10).trim() === objective && objective) {
+        goal = { objective, status: "active", source: "native", updated_at: row.timestamp };
+      } else if (["clear", "off"].includes(command) && text.startsWith("Goal cleared")) {
+        goal = { objective: "", status: "cleared", updated_at: row.timestamp };
+      } else if (["", "status"].includes(command)) {
+        const active = text.match(/^Goal active: ([\s\S]+?) \((?:not yet evaluated|(\d+) turns?)\)/);
+        if (active) goal = { objective: active[1], status: "active", checks: Number(active[2] || 0), updated_at: row.timestamp };
+        else if (text.startsWith("No goal set")) goal = { objective: "", status: "cleared", updated_at: row.timestamp };
+      }
+      command = null;
+    }
+  }
+  return goal;
+}
+async function readNativeGoal(owner, sessionId, bridge) {
+  const key = JSON.stringify([owner.connectionId, owner.profile, sessionId]);
+  const previous = cache.get(key);
+  const limit = previous ? 50 : 500;
+  let rows = [], offset = 0;
+  for (; ; ) {
+    const query = new URLSearchParams({ profile: owner.profile, limit: String(limit), offset: String(offset), order: "latest", include_compacted: "true", inline_images: "false" });
+    const page = await bridge({
+      connectionId: owner.connectionId,
+      profile: owner.profile,
+      path: `/api/sessions/${encodeURIComponent(sessionId)}/messages?${query}`,
+      timeoutMs: 1e4
+    });
+    if (page.session_id !== sessionId) throw new Error("Goal history belongs to another thread");
+    const messages = [...page.messages || []].sort((a, b) => a.id - b.id);
+    rows = [...messages, ...rows];
+    if (messages.length < limit || previous && messages.some((row) => row.id <= previous.lastId) || !previous && confirmedNativeGoal(rows)) break;
+    offset += messages.length;
+  }
+  const newRows = previous ? rows.filter((row) => row.id > previous.lastId) : rows;
+  if (previous?.lastUser && !newRows.some((row) => row.id === previous.lastUser.id)) newRows.unshift(previous.lastUser);
+  const goal = confirmedNativeGoal(newRows, previous?.goal);
+  const lastUser = [...newRows].reverse().find((row) => row.role === "user" && row.display_kind !== "hidden") || previous?.lastUser;
+  if (!cache.has(key) && cache.size >= 32) cache.delete(cache.keys().next().value);
+  cache.set(key, { goal, lastUser, lastId: Math.max(previous?.lastId || 0, ...rows.map((row) => row.id)) });
+  return goal;
+}
+async function legacyGoal(owner, sessionId, runtimeId, bridge) {
+  const route = { ...owner, targetProfile: owner.profile, mode: owner.connectionId === "local" ? "local" : "remote" };
+  let core = null;
+  if (runtimeId) {
+    const snapshot2 = await host5.requestProfile(route, "session.control.read", { session_id: runtimeId });
+    const state = snapshot2?.control?.goal;
+    if (state) core = {
+      ...state,
+      objective: state.goal,
+      source: "hermes",
+      updated_at: Math.max(state.created_at || 0, state.last_turn_at || 0)
+    };
+  }
+  const native = await readNativeGoal(owner, sessionId, bridge);
+  const goal = !native || core && core.updated_at >= native.updated_at ? core : native;
+  return goal?.status === "cleared" ? null : goal;
+}
+
+// features/goals/desktop.js
+var legacyBackends = /* @__PURE__ */ new Set();
 var h5 = React5.createElement;
+var QUERY2 = "t3code-goals";
+var LABELS = { active: "Pursuing goal", waiting: "Waiting on goal", paused: "Goal paused", done: "Goal complete", complete: "Goal complete" };
+async function fetchGoal(owner, sessionId, runtimeId = null) {
+  if (!owner?.connectionId || !owner?.profile || !sessionId) return null;
+  const bridge = window.hermesDesktop?.api;
+  if (typeof bridge !== "function") throw new Error("Hermes desktop bridge unavailable");
+  const backend = `${owner.connectionId}/${owner.profile}`;
+  if (legacyBackends.has(backend)) return legacyGoal(owner, sessionId, runtimeId, bridge);
+  let result;
+  try {
+    result = await bridge({
+      connectionId: owner.connectionId,
+      profile: owner.profile,
+      path: `/api/plugins/t3code/goals/sessions/${encodeURIComponent(sessionId)}?profile=${encodeURIComponent(owner.profile)}`,
+      timeoutMs: 1e4
+    });
+  } catch (error) {
+    if (error?.status !== 404 && error?.statusCode !== 404 && !/\b404\b/.test(String(error?.message || error))) throw error;
+    if (legacyBackends.size >= 32) legacyBackends.delete(legacyBackends.values().next().value);
+    legacyBackends.add(backend);
+    return legacyGoal(owner, sessionId, runtimeId, bridge);
+  }
+  if (result?.session_id !== sessionId) throw new Error("Goal response belongs to another thread");
+  return result.goal || null;
+}
+var TargetIcon = () => h5(
+  "svg",
+  {
+    width: 12,
+    height: 12,
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 2,
+    strokeLinecap: "round",
+    strokeLinejoin: "round",
+    "aria-hidden": true
+  },
+  h5("circle", { cx: 12, cy: 12, r: 10 }),
+  h5("circle", { cx: 12, cy: 12, r: 6 }),
+  h5("circle", { cx: 12, cy: 12, r: 2 })
+);
+var MUTED = "var(--ui-text-secondary, var(--muted-foreground))";
+function GoalCallout({ goal, stale = false, retry }) {
+  if (!goal?.objective || goal.status === "cleared") return null;
+  const title = LABELS[goal.status] || "Goal";
+  const objective = h5("span", { style: {
+    minWidth: 0,
+    flex: 1,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    color: MUTED
+  } }, goal.objective);
+  return h5(
+    "div",
+    {
+      "data-t3-goal": goal.status,
+      role: "status",
+      "aria-live": "polite",
+      style: { display: "flex", alignItems: "center", gap: 4, minWidth: 0, height: 28, fontSize: 12, lineHeight: "16px" }
+    },
+    h5("span", { style: { display: "flex", width: 24, flex: "none", justifyContent: "center", color: MUTED } }, h5(TargetIcon)),
+    h5("span", { style: { flex: "none", fontWeight: 500, color: "var(--ui-text-primary, var(--foreground))" } }, title),
+    Tip4 ? h5(Tip4, { label: goal.objective }, objective) : objective,
+    stale && h5("button", {
+      type: "button",
+      onClick: retry,
+      title: "Goal status could not refresh",
+      style: { flex: "none", background: "none", border: 0, padding: "0 6px", color: MUTED, font: "inherit", cursor: "pointer" }
+    }, "Retry")
+  );
+}
+function GoalStrip() {
+  const sessionId = useValue5(host6.state.focusedStoredSessionId);
+  const owner = useValue5(host6.state.focusedSessionOwner);
+  const runtimeId = useValue5(host6.state.focusedSessionId);
+  const query = useQuery5({
+    queryKey: [QUERY2, owner?.connectionId, owner?.profile, sessionId, runtimeId],
+    queryFn: () => fetchGoal(owner, sessionId, runtimeId),
+    enabled: Boolean(sessionId && owner?.connectionId && owner?.profile),
+    refetchInterval: 2500,
+    staleTime: 1e3,
+    retry: 1
+  });
+  return h5(GoalCallout, {
+    key: `${owner?.connectionId}/${owner?.profile}/${sessionId}`,
+    goal: query.data,
+    stale: query.isError,
+    retry: () => void query.refetch()
+  });
+}
+var desktop_default5 = {
+  register(ctx) {
+    ctx.register({
+      id: "pursuing-goal",
+      area: COMPOSER_AREAS3.top,
+      order: -100,
+      render: () => h5(GoalStrip)
+    });
+    for (const event of ["session.control.update", "session.resumed", "session.info", "turn.completed", "message.final"]) {
+      ctx.onEvent(event, () => void queryClient5.invalidateQueries({ queryKey: [QUERY2] }));
+    }
+  }
+};
+
+// shared/desktop/isolation.js
+import React6 from "react";
+var h6 = React6.createElement;
 var LOUD_AREAS = /* @__PURE__ */ new Set(["panes", "routes", "settings.plugins"]);
 function errText2(error) {
   return error instanceof Error ? error.message : String(error);
@@ -4963,7 +5148,7 @@ function Invoke({ fn }) {
   const out = fn();
   return out === void 0 ? null : out;
 }
-var FeatureBoundary = class extends React5.Component {
+var FeatureBoundary = class extends React6.Component {
   constructor(props) {
     super(props);
     this.state = { error: null };
@@ -4982,13 +5167,13 @@ var FeatureBoundary = class extends React5.Component {
     if (!this.props.loud) {
       return null;
     }
-    return h5(
+    return h6(
       "div",
       { style: { display: "flex", flexDirection: "column", gap: 8, padding: 16, fontSize: 12 } },
-      h5("div", { style: { color: "var(--ui-red, #e5484d)", fontWeight: 600 } }, `T3 Code \xB7 ${this.props.label} hit an error`),
-      h5("div", { style: { color: "var(--ui-text-secondary)", whiteSpace: "pre-wrap" } }, errText2(error)),
-      h5("div", { style: { color: "var(--ui-text-tertiary)" } }, "The other T3 Code features are unaffected."),
-      h5(
+      h6("div", { style: { color: "var(--ui-red, #e5484d)", fontWeight: 600 } }, `T3 Code \xB7 ${this.props.label} hit an error`),
+      h6("div", { style: { color: "var(--ui-text-secondary)", whiteSpace: "pre-wrap" } }, errText2(error)),
+      h6("div", { style: { color: "var(--ui-text-tertiary)" } }, "The other T3 Code features are unaffected."),
+      h6(
         "button",
         {
           onClick: () => this.setState({ error: null }),
@@ -5010,7 +5195,7 @@ var FeatureBoundary = class extends React5.Component {
   }
 };
 function guardRender(feature, fn, report, loud) {
-  return (...args) => h5(FeatureBoundary, { label: feature.label, loud, onError: (e) => report(e, "render") }, h5(Invoke, { fn: () => fn(...args) }));
+  return (...args) => h6(FeatureBoundary, { label: feature.label, loud, onError: (e) => report(e, "render") }, h6(Invoke, { fn: () => fn(...args) }));
 }
 function guardFn(fn, report, where) {
   if (typeof fn !== "function") {
@@ -5137,13 +5322,14 @@ function featureContext(ctx, feature, entry, { report, settings: settings2 }) {
 }
 
 // shared/desktop/shell.js
-var { host: host5, atom: atom4, useValue: useValue5, ToggleRow: ToggleRow2, ListRow: ListRow2, Button: Button3 } = sdk5;
-var h6 = React6.createElement;
+var { host: host7, atom: atom4, useValue: useValue6, ToggleRow: ToggleRow2, ListRow: ListRow2, Button: Button3 } = sdk5;
+var h7 = React7.createElement;
 var PLUGIN_ID = "t3code";
 var TOGGLE_POLL_MS = 3e4;
 var DESKTOP_FEATURES = [
   { key: "inbox", label: "Inbox", legacy: "t3-inbox", module: desktop_default },
   { key: "usage", label: "Usage", legacy: "t3-usage", module: desktop_default3 },
+  { key: "goals", label: "Goals", module: desktop_default5 },
   { key: "orchestrator", label: "Orchestrator", legacy: "t3-orchestrator", module: desktop_default2 },
   { key: "claude_cli", label: "Claude CLI", module: desktop_default4 }
 ];
@@ -5152,6 +5338,7 @@ var AGENT_ONLY = [
   { key: "antigravity", label: "Antigravity" }
 ];
 var DESCRIPTIONS = {
+  goals: "A persistent T3-style goal strip above the composer, independent of the selected model or native harness.",
   inbox: "T3\u2019s thread sidebar: pinned, inbox, working, snoozed and settled, with crash and usage-limit recovery.",
   usage: "Claude Code, Codex and Z.ai tokens, cost and live limits in Command Center \u2192 Usage.",
   orchestrator: "Delegated agents, forks and merge-back, durable queues, recovery and schedules. The agent tools change after a backend restart.",
@@ -5200,7 +5387,7 @@ function failFeature(feature, error) {
   stopFeature(feature.key);
   patchLocal(feature.key, { state: "failed", error: errText3(error) });
   try {
-    host5.notify({ kind: "error", message: `${feature.label} failed to start: ${errText3(error)}. Other T3 Code features keep running.`, title: "T3 Code" });
+    host7.notify({ kind: "error", message: `${feature.label} failed to start: ${errText3(error)}. Other T3 Code features keep running.`, title: "T3 Code" });
   } catch {
   }
 }
@@ -5268,7 +5455,7 @@ async function setFeature(key, enabled) {
     $remote.set({ at: Date.now(), error: null, features: res?.features || [] });
     adoptToggles(res?.features);
   } catch (error) {
-    host5.notify({ kind: "error", message: `Could not save: ${errText3(error)}`, title: "T3 Code" });
+    host7.notify({ kind: "error", message: `Could not save: ${errText3(error)}`, title: "T3 Code" });
     void syncToggles();
   }
 }
@@ -5304,14 +5491,14 @@ function registerSettings() {
     return {
       id: f.key,
       title: f.label,
-      render: () => h6(FeatureBoundary, { label: f.label, loud: true, onError: (e) => reporter(f)(e, "settings") }, h6(Invoke, { fn: page.render }))
+      render: () => h7(FeatureBoundary, { label: f.label, loud: true, onError: (e) => reporter(f)(e, "settings") }, h7(Invoke, { fn: page.render }))
     };
   });
   disposeSettings = ctxRef4.registerSettingsPage?.({
     children,
     icon: "layers",
     id: "settings",
-    render: () => h6(Overview, null),
+    render: () => h7(Overview, null),
     title: "T3 Code"
   }) || null;
 }
@@ -5333,14 +5520,14 @@ function statusText(feature, on, local, remote) {
   return local?.state === "running" || !DESKTOP_FEATURES.some((f) => f.key === feature.key) ? "Running" : "Starting\u2026";
 }
 function Overview() {
-  const toggles = useValue5($toggles);
-  const remote = useValue5($remote);
-  const local = useValue5($local);
+  const toggles = useValue6($toggles);
+  const remote = useValue6($remote);
+  const local = useValue6($local);
   const byKey2 = Object.fromEntries((remote.features || []).map((f) => [f.key, f]));
-  return h6(
+  return h7(
     "div",
     { style: { display: "flex", flexDirection: "column", gap: 4 } },
-    h6(
+    h7(
       "p",
       { style: { color: "var(--ui-text-secondary)", fontSize: 12, margin: "0 0 8px" } },
       "Each feature runs on its own: switching one off, or one failing, leaves the others working. The same switches are in Capabilities \u25B8 Plugins \u25B8 T3 Code."
@@ -5349,23 +5536,23 @@ function Overview() {
       const on = toggles[feature.key] !== false;
       const desktop = DESKTOP_FEATURES.find((f) => f.key === feature.key);
       const status = statusText(feature, on, local[feature.key], byKey2[feature.key]);
-      return h6(
+      return h7(
         "div",
         { key: feature.key, style: { display: "flex", flexDirection: "column" } },
-        h6(ToggleRow2, {
+        h7(ToggleRow2, {
           checked: on,
           description: `${DESCRIPTIONS[feature.key]}  \xB7  ${status}`,
           label: feature.label,
           onChange: (v) => void setFeature(feature.key, v)
         }),
-        desktop && on && (local[feature.key]?.state === "failed" || local[feature.key]?.lastError) ? h6(ListRow2, {
-          action: h6(Button3, { onClick: () => restartFeature(desktop), size: "sm", variant: "outline" }, "Restart"),
+        desktop && on && (local[feature.key]?.state === "failed" || local[feature.key]?.lastError) ? h7(ListRow2, {
+          action: h7(Button3, { onClick: () => restartFeature(desktop), size: "sm", variant: "outline" }, "Restart"),
           description: "Stops and starts this feature only.",
           title: `Restart ${feature.label}`
         }) : null
       );
     }),
-    remote.error ? h6(
+    remote.error ? h7(
       "p",
       { style: { color: "var(--ui-text-tertiary)", fontSize: 12, margin: "8px 0 0" } },
       `Backend not reachable (${remote.error}); using the last known switches.`
@@ -5395,8 +5582,8 @@ var shell_default = {
     void syncToggles();
     ctx.setInterval(() => !document.hidden && void syncToggles(), TOGGLE_POLL_MS);
     ctx.addEventListener(document, "visibilitychange", () => !document.hidden && void syncToggles());
-    if (host5.state?.profile?.subscribe) {
-      ctx.onDispose(host5.state.profile.subscribe(() => void syncToggles()));
+    if (host7.state?.profile?.subscribe) {
+      ctx.onDispose(host7.state.profile.subscribe(() => void syncToggles()));
     }
   }
 };

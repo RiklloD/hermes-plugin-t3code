@@ -20,6 +20,7 @@ import inbox from '../../features/inbox/desktop.js'
 import orchestrator from '../../features/orchestrator/desktop.js'
 import usage from '../../features/usage/desktop.js'
 import claudeCli from '../../features/claude_cli/desktop.js'
+import goals from '../../features/goals/desktop.js'
 
 import { FeatureBoundary, featureContext, Invoke, migrateLegacyStorage } from './isolation.js'
 
@@ -34,6 +35,7 @@ const TOGGLE_POLL_MS = 30_000
 const DESKTOP_FEATURES = [
   { key: 'inbox', label: 'Inbox', legacy: 't3-inbox', module: inbox },
   { key: 'usage', label: 'Usage', legacy: 't3-usage', module: usage },
+  { key: 'goals', label: 'Goals', module: goals },
   { key: 'orchestrator', label: 'Orchestrator', legacy: 't3-orchestrator', module: orchestrator },
   { key: 'claude_cli', label: 'Claude CLI', module: claudeCli }
 ]
@@ -43,6 +45,7 @@ const AGENT_ONLY = [
   { key: 'antigravity', label: 'Antigravity' }
 ]
 const DESCRIPTIONS = {
+  goals: 'A persistent T3-style goal strip above the composer, independent of the selected model or native harness.',
   inbox: 'T3’s thread sidebar: pinned, inbox, working, snoozed and settled, with crash and usage-limit recovery.',
   usage: 'Claude Code, Codex and Z.ai tokens, cost and live limits in Command Center → Usage.',
   orchestrator: 'Delegated agents, forks and merge-back, durable queues, recovery and schedules. The agent tools change after a backend restart.',

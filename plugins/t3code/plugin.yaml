@@ -32,6 +32,11 @@ config_schema:
     default: true
     label: Inbox
     description: T3's thread sidebar (pinned, inbox, working, snoozed, settled) with crash and usage-limit recovery. Applies live.
+  goals:
+    type: boolean
+    default: true
+    label: Goals
+    description: Persistent goal strip above the composer for Hermes API models and native agents. Applies live.
   usage:
     type: boolean
     default: true
