@@ -62,6 +62,11 @@ config_schema:
     default: true
     label: Antigravity
     description: Google's official Antigravity ACP agent as the "Antigravity" model provider. Applies after a backend restart.
+  inject_soul:
+    type: boolean
+    default: true
+    label: Inject SOUL.md
+    description: Give Claude CLI, Muse Code and Antigravity the active profile's SOUL.md, which Hermes only injects into its own API-model turns. Applies to new sessions and relaunches.
   # ── Claude CLI ───────────────────────────────────────────────────────────────────────────
   claude_executable:
     type: string

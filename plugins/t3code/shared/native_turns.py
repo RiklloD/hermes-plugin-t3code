@@ -13,6 +13,8 @@ from typing import Callable, Optional
 
 from agent.native_runtime import NativeAgentRuntime
 
+from . import identity
+
 
 class TurnRuntime(NativeAgentRuntime):
     label = "Native runtime"
@@ -24,6 +26,31 @@ class TurnRuntime(NativeAgentRuntime):
         self._responders: dict[str, Callable[[dict], None]] = {}
         self._closed = False
         self._interrupted = threading.Event()
+        self._soul_hash = self.state.get("soul_hash")  # the SOUL.md version this session last received
+
+    # ── profile identity ──────────────────────────────────────────────────────────────────────
+
+    def identity_block(self, *, command: bool = False):
+        """``(text, hash)`` of the profile's SOUL.md when this session still needs it, else None.
+
+        The agent has no system-prompt channel, so SOUL.md rides as a leading block of the turn: on
+        the session's first turn and again whenever the file changed. A slash command turn is
+        skipped (the agent parses the command from the prompt start); the next turn carries it.
+        Confirm delivery with :meth:`identity_sent`.
+        """
+        if command:
+            return None
+        ident = identity.resolve(self.environment)
+        if not ident or ident["hash"] == self._soul_hash:
+            return None
+        return ident["text"], ident["hash"]
+
+    def identity_sent(self, digest: str) -> None:
+        """Remember the delivery in memory and in the persisted native state (survives resume)."""
+        self._soul_hash = digest
+        if getattr(self, "session_id", None):
+            self.emit({"type": "session", "state": {"session_id": self.session_id, "cwd": self.cwd,
+                                                    "soul_hash": digest}})
 
     # ── subclass hooks ────────────────────────────────────────────────────────────────────────
 
@@ -94,6 +121,14 @@ class TurnRuntime(NativeAgentRuntime):
         self._closed = True
         self.end(error=f"{self.label} session closed")
         self.shutdown()
+
+
+def is_slash_command(text: str) -> bool:
+    """``/name args`` (not ``//…`` and not a path like ``/usr/bin``): the agent runs it from the prompt start."""
+    if not text.startswith("/") or text.startswith("//"):
+        return False
+    name = text[1:].partition(" ")[0].strip()
+    return bool(name) and "/" not in name
 
 
 def message_parts(message) -> tuple[str, list[tuple[str, str]]]:

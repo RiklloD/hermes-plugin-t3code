@@ -139,6 +139,15 @@ def native_options(settings: dict, environment: dict, cwd: str, state: dict, *, 
         forward_subagent_text=True,
     )
     if not probe:
+        # Hermes does not build this agent's system prompt, so the profile's SOUL.md is appended to Claude Code's.
+        # It is rebuilt on every launch, so resumed sessions and relaunches follow the current file.
+        try:
+            from t3code_shared import identity
+            soul = identity.resolve(environment)
+        except Exception:
+            soul = None
+        if soul:
+            options.system_prompt = {"type": "preset", "preset": "claude_code", "append": soul["text"]}
         policy = context_policy(model, settings)
         options.model = launch_model(model, policy)
         if policy != "auto":

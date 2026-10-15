@@ -11,7 +11,7 @@ import json
 import threading
 
 from t3code_shared import native_commands, orchestration
-from t3code_shared.native_turns import TurnRuntime, message_parts
+from t3code_shared.native_turns import TurnRuntime, is_slash_command, message_parts
 from t3code_shared.stdio_rpc import RpcError, StdioRpc, uuid7
 
 from . import catalog, commands, protocol
@@ -136,6 +136,10 @@ class MuseRuntime(TurnRuntime):
             if (selector := self._skill_selector(name)) is not None:
                 # Muse resolves and expands its own skill; the images ride along.
                 parts = [{"type": "skill", "selector": selector, **({"arguments": args} if args else {})}, *parts[1:]]
+        # Muse has no system-prompt input: the profile's SOUL.md leads the first turn (and any after it changes).
+        soul = self.identity_block(command=is_slash_command(text))
+        if soul:
+            parts = [{"type": "text", "text": soul[0]}, *parts]
         effort = protocol.resolve_effort(catalog.cached_row(self.session_model or ""),
                                          str(self.settings.get("reasoning_effort") or ""))
         turn_id = uuid7()
@@ -153,6 +157,8 @@ class MuseRuntime(TurnRuntime):
             raise
         if (result or {}).get("turnId") != turn_id:
             raise RuntimeError("Muse admitted the turn under an unexpected identity")
+        if soul:
+            self.identity_sent(soul[1])
 
     @staticmethod
     def _new_turn(turn_id):

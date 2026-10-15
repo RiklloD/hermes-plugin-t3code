@@ -9,7 +9,7 @@ import json
 import threading
 
 from t3code_shared import orchestration
-from t3code_shared.native_turns import TurnRuntime, message_parts
+from t3code_shared.native_turns import TurnRuntime, is_slash_command, message_parts
 from t3code_shared.stdio_rpc import RpcError, StdioRpc
 
 from . import catalog, commands, protocol
@@ -115,9 +115,14 @@ class AntigravityRuntime(TurnRuntime):
         self.hermes_session = orchestration.current_session_key() or self.hermes_session
         self._ensure_host()
         self._apply_model(model)
+        # ACP has no system-prompt input: the profile's SOUL.md leads the first turn (and any after it changes).
+        soul = self.identity_block(command=is_slash_command(text))
+        if soul:
+            blocks = [{"type": "text", "text": soul[0]}, *blocks]
         with self._lock:
             self._turn = {"text": [], "reasoning": [], "tools": {}, "started": set(), "done": set(),
-                          "requests": {}, "final": [], "context": None}
+                          "requests": {}, "final": [], "context": None,
+                          "soul": soul[1] if soul else None}
         future = self.rpc.call("session/prompt", {"sessionId": self.session_id, "prompt": blocks})
         future.add_done_callback(self._prompt_done)
 
@@ -144,6 +149,8 @@ class AntigravityRuntime(TurnRuntime):
         except Exception as exc:
             return self.end(error=str(exc))
         reason = result.get("stopReason")
+        if turn.get("soul"):
+            self.identity_sent(turn["soul"])  # the agent accepted the prompt that carried it
         usage = {}
         if isinstance(result.get("usage"), dict):  # ACP's optional prompt usage
             u = result["usage"]

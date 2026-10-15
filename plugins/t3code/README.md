@@ -89,6 +89,17 @@ native one is namespaced: `/claude:compact`, `/muse:goal`, `/agy:plan`.
 Lists are cached in `plugin-data/t3code/commands.json` and refreshed in the background; a live session's
 own list always wins. The hook needs the `agent/native_commands.py` host seam (Hermes gateway).
 
+## Profile SOUL.md in native agents
+
+Hermes injects the profile's `SOUL.md` into the system prompt of its own API-model turns. Claude CLI, Claude CLI 2, Muse Code and Antigravity bypass that prompt, so t3code delivers it (`shared/identity.py`, setting `inject_soul`, on by default). The profile is the turn's `HERMES_HOME`, loaded with Hermes' own `load_soul_md` (injection scan, size cap).
+
+| Provider | Delivery |
+|---|---|
+| Claude CLI / 2 | Appended to Claude Code's system prompt on every launch, resume and relaunch |
+| Muse Code, Antigravity | No system-prompt input: a leading `<profile-identity>` block on the session's first turn, and again whenever SOUL.md changes (hash kept in the native session state). Slash-command turns wait for the next turn |
+
+Everything fails open: a missing or unreadable SOUL.md just means no identity.
+
 ## Data and compatibility
 
 - Data stays where it was: `plugin-data/t3-inbox/lifecycle.json` and `plugin-data/t3-orchestrator/orchestrator.db`.
