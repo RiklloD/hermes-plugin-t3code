@@ -237,10 +237,29 @@ index 214a605cb0..032a570c94 100644
      before_tokens = estimate_request_tokens(agent, before)
      head, tail = before, []
 diff --git a/agent/interrupt_control.py b/agent/interrupt_control.py
-index 06117c1c9a..c35d98a873 100644
+index 06117c1c9a..a3d24da2f8 100644
 --- a/agent/interrupt_control.py
 +++ b/agent/interrupt_control.py
-@@ -195,6 +195,9 @@ class InterruptControlMixin:
+@@ -93,6 +93,18 @@ def _ic_codex_method(agent, name: str):
+     return method if callable(method) else None
+ 
+ 
++def _native_runtime_steer(agent, text: str) -> bool:
++    """Plugin-owned runtimes steer natively; False (the surface queues a new turn) when no turn is live."""
++    runtime = getattr(agent, "_native_runtime", None)
++    if runtime is None or agent._interrupt_requested:
++        return False
++    try:
++        return bool(runtime.steer(text))
++    except Exception:
++        logger.debug("Native runtime steer failed", exc_info=True)
++        return False
++
++
+ def _ic_abort_active_request(agent, reason: str, failure_log: str) -> None:
+     """Shut the registered in-flight request's sockets (cron turns register their client here)."""
+     abort = getattr(agent, "_active_request_abort", None)
+@@ -195,6 +207,9 @@ class InterruptControlMixin:
              self._pending_redirect = None
  
          # Codex watches a private interrupt event rather than Hermes' per-thread flag.
@@ -250,6 +269,25 @@ index 06117c1c9a..c35d98a873 100644
          _request_interrupt = _ic_codex_method(self, "request_interrupt")
          if _request_interrupt is not None:
              try:
+@@ -270,6 +285,9 @@ class InterruptControlMixin:
+         if not text or not text.strip():
+             return False
+         cleaned = text.strip()
++        # A native runtime owns its loop and never drains _pending_steer; it steers its live turn itself.
++        if getattr(self, "_native_runtime_kind", ""):
++            return _native_runtime_steer(self, cleaned)
+         with _ic_lock(self, "_pending_steer_lock"):
+             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
+             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+@@ -285,6 +303,8 @@ class InterruptControlMixin:
+         if not text or not text.strip():
+             return False
+         cleaned = text.strip()
++        if getattr(self, "_native_runtime_kind", ""):
++            return _native_runtime_steer(self, cleaned)
+ 
+         _native_steer = _ic_codex_method(self, "request_steer")
+         if _native_steer is not None:
 diff --git a/agent/native_commands.py b/agent/native_commands.py
 new file mode 100644
 index 0000000000..b0392b85d5
@@ -365,10 +403,10 @@ index 0000000000..b0392b85d5
 +    return prefix + inner
 diff --git a/agent/native_runtime.py b/agent/native_runtime.py
 new file mode 100644
-index 0000000000..4d049bac0a
+index 0000000000..1a1ad054e6
 --- /dev/null
 +++ b/agent/native_runtime.py
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,296 @@
 +"""Host boundary for plugin-owned agent loops. Native history is never replayed from the mirror."""
 +
 +from __future__ import annotations
@@ -402,6 +440,10 @@ index 0000000000..4d049bac0a
 +    @abstractmethod
 +    def close(self) -> None:
 +        """Release the owned process; native persisted history remains resumable."""
++
++    def steer(self, text: str) -> bool:
++        """Deliver user text into the live turn without interrupting it. False when unsupported or idle."""
++        return False
 +
 +
 +def runtime_profile(provider: str):

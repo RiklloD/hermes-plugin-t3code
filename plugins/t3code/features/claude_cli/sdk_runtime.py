@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import logging
 import queue
 import threading
 import time
@@ -11,8 +12,12 @@ import uuid
 
 from agent.native_runtime import NativeAgentRuntime
 
-from .options import native_options
+from .options import bridge_mode, hermes_executable, native_options
 from .projection import Projector
+
+
+PLAN_APPROVE = "Approve plan and start"
+PLAN_REVISE = "Keep planning"
 
 
 def _prompt(message):
@@ -90,6 +95,7 @@ class ClaudeRuntime(NativeAgentRuntime):
         async def keep_open(_data, _tool_use_id, _context):
             return {"continue_": True}
         options.hooks = {"PreToolUse": [HookMatcher(matcher=None, hooks=[keep_open])]}
+        self._attach_bridge(options)
         from .t3_bridge import server as t3_server
         if (t3 := t3_server()) is not None:
             options.mcp_servers = {**(options.mcp_servers if isinstance(options.mcp_servers, dict) else {}), "t3": t3}
@@ -97,6 +103,7 @@ class ClaudeRuntime(NativeAgentRuntime):
         from .model_selection import context_policy, launch_model
         policy = context_policy("default", self.settings)
         state = dict(self.state)
+        self._live_state = state
         active_model = options.model
         async with AsyncExitStack() as stack:
             client = await stack.enter_async_context(ClaudeSDKClient(options))
@@ -132,7 +139,7 @@ class ClaudeRuntime(NativeAgentRuntime):
                             await stack.aclose()
                             updated = native_options(self.settings, self.environment, self.cwd, state, model=model)
                             updated.can_use_tool, updated.hooks = options.can_use_tool, options.hooks
-                            updated.mcp_servers = options.mcp_servers
+                            updated.mcp_servers, updated.allowed_tools = options.mcp_servers, getattr(options, "allowed_tools", None)
                             client = await stack.enter_async_context(ClaudeSDKClient(updated))
                             self._client = client
                             policy, active_model = selected_policy, updated.model
@@ -159,6 +166,27 @@ class ClaudeRuntime(NativeAgentRuntime):
                 self._reader_task.cancel()
                 await asyncio.gather(self._reader_task, return_exceptions=True)
                 self._client = None
+
+    def _attach_bridge(self, options):
+        """Hermes profile delegation (bridge.py): Claude can start tasks on other Hermes profiles."""
+        mode = bridge_mode(self.settings)
+        if mode == "off":
+            return
+        try:
+            hermes = hermes_executable(self.settings)
+            from hermes_constants import get_hermes_home
+            from .bridge import SERVER, TaskRegistry, build_server
+            registry = TaskRegistry(get_hermes_home() / "cache" / "claude-cli" / "tasks", hermes,
+                                    dict(self.environment), self.cwd,
+                                    lambda: getattr(self, "_live_state", self.state).get("session_id", ""))
+            server, preapproved = build_server(registry, mode)
+        except Exception:
+            # Optional: a broken bridge must not take the native session down with it.
+            logging.getLogger("t3code.claude").warning("profile bridge unavailable", exc_info=True)
+            return
+        self._registry = registry
+        options.mcp_servers = {**(options.mcp_servers if isinstance(options.mcp_servers, dict) else {}), SERVER: server}
+        options.allowed_tools = [*(getattr(options, "allowed_tools", None) or []), *preapproved]
 
     # A background Bash, Monitor or subagent outlives the turn that started it; the thread is not
     # done while one is running, because its result wakes the conversation again.
@@ -242,11 +270,17 @@ class ClaudeRuntime(NativeAgentRuntime):
             event["questions"] = [{"qid": f"q{i}", "question": q["question"],
                 "choices": [o["label"] for o in q.get("options", [])], "multi_select": bool(q.get("multiSelect"))}
                 for i, q in enumerate(inputs.get("questions", []))]
+        elif name == "ExitPlanMode":
+            event["kind"] = "question"
+            event["questions"] = [{"qid": "q0", "question": f"Claude proposes this plan:\n\n{inputs.get('plan', '')}",
+                                   "choices": [PLAN_APPROVE, PLAN_REVISE], "multi_select": False}]
         self._route(event)
         try:
             response = await future
         finally:
             self._pending.pop(request_id, None)
+        if name == "ExitPlanMode":
+            return self._plan_decision(response, inputs)
         if not response.get("allowed"):
             return PermissionResultDeny(message=response.get("message") or "Permission denied.")
         updated = dict(inputs)
@@ -256,6 +290,19 @@ class ClaudeRuntime(NativeAgentRuntime):
                                   for i, q in enumerate(inputs.get("questions", []))
                                   if f"q{i}" in answers and answers[f"q{i}"] is not None}
         return PermissionResultAllow(updated_input=updated)
+
+    def _plan_decision(self, response, inputs):
+        from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny, PermissionUpdate
+        answer = ((response.get("answer") or {}).get("answers") or {}).get("q0")
+        answer = ", ".join(answer) if isinstance(answer, list) else str(answer or "")
+        if response.get("allowed") and answer == PLAN_APPROVE:
+            mode = str(self.settings.get("permission_mode") or "default")
+            mode = "default" if mode == "plan" else mode
+            return PermissionResultAllow(updated_input=dict(inputs), updated_permissions=[
+                PermissionUpdate(type="setMode", mode=mode, destination="session")])
+        feedback = answer if answer and answer != PLAN_REVISE else ""
+        return PermissionResultDeny(message="The user did not approve the plan yet. Stay in plan mode and revise it."
+                                    + (f" User feedback: {feedback}" if feedback else ""))
 
     def run_turn(self, message, *, model):
         if self._closed:
@@ -296,6 +343,25 @@ class ClaudeRuntime(NativeAgentRuntime):
                 yield from self._consume(event["events"])
             else:
                 yield event
+
+    def steer(self, text):
+        """Deliver user text into the live native turn (priority "now"); False when no turn is running."""
+        client, loop = self._client, self._loop
+        if (not text or not text.strip() or client is None or loop is None or not self._busy.locked()
+                or self._interrupt_pending.is_set()):
+            return False
+
+        async def send():
+            async def one():
+                yield {"type": "user", "message": {"role": "user", "content": text.strip()},
+                       "parent_tool_use_id": None, "priority": "now"}
+            await client.query(one())
+            return True
+        try:
+            return bool(asyncio.run_coroutine_threadsafe(send(), loop).result(timeout=10))
+        except Exception:
+            logging.getLogger("t3code.claude").debug("steer failed", exc_info=True)
+            return False
 
     def respond(self, request_id, response):
         def complete():

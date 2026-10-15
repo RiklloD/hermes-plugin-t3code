@@ -106,6 +106,24 @@ def executable(settings: dict) -> str:
     return resolved.command[0]
 
 
+def hermes_executable(settings: dict) -> str:
+    from hermes_platform.resolver import locate_command
+    candidate = str(settings.get("hermes_executable") or "hermes")
+    resolved = locate_command(candidate, known_dirs=(str(Path.home() / ".local/bin"),
+                               str(Path.home() / ".hermes/hermes-agent/.hermes/bin"), "/opt/homebrew/bin"))
+    if not resolved.found:
+        raise FileNotFoundError("The hermes command is not on PATH; set claude_hermes_executable for the profile bridge.")
+    return resolved.command[0]
+
+
+def bridge_mode(settings: dict) -> str:
+    from .bridge import MODES
+    mode = str(settings.get("hermes_bridge") or "full")
+    if mode not in MODES:
+        raise ValueError(f"claude_hermes_bridge must be one of {sorted(MODES)}")
+    return mode
+
+
 def native_options(settings: dict, environment: dict, cwd: str, state: dict, *, probe=False, model="default"):
     from .model_selection import context_policy, launch_model
     from claude_agent_sdk import ClaudeAgentOptions

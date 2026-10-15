@@ -100,6 +100,17 @@ config_schema:
     default: [user, project, local]
     label: "Claude CLI · setting sources"
     description: Native Claude settings sources.
+  claude_hermes_bridge:
+    type: string
+    default: full
+    choices: [full, approve, read_only, "off"]
+    label: "Claude CLI · Hermes profile bridge"
+    description: "Lets Claude start tasks on your other Hermes profiles. full = no approval needed; approve = every start/stop asks first; read_only = list/status only; off = disabled. Applies to new sessions."
+  claude_hermes_executable:
+    type: string
+    default: hermes
+    label: "Claude CLI · hermes command"
+    description: Hermes command used to start delegated profile tasks.
   # ── Muse Code ────────────────────────────────────────────────────────────────────────────
   muse_binary_path:
     type: string
