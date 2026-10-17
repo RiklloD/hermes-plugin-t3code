@@ -195,6 +195,7 @@ def load_feature_module(key: str, filename: str) -> ModuleType:
 
 def register_agent_features(ctx) -> None:
     """Start every enabled feature that has an agent half, each behind its own boundary."""
+    guarded("host_fixes", "agent", lambda: importlib.import_module("t3code_shared.host_fixes").apply_all())
     for feature in FEATURES.values():
         if not feature.agent:
             continue

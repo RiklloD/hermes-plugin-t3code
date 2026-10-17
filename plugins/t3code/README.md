@@ -32,6 +32,7 @@ t3code/
 │   ├── stdio_rpc.py         newline JSON-RPC over a child's stdio (Muse MSP + Antigravity ACP)
 │   ├── native_turns.py      NativeAgentRuntime turn plumbing for the stdio providers
 │   ├── native_commands.py   the native agents' slash-command cache (Hermes's slash menu)
+│   ├── host_fixes.py        runtime fixes to Hermes core that survive updates (turns survive Mac sleep)
 │   └── desktop/
 │       ├── shell.js         the Desktop plugin: starts/stops features from the toggles, T3 Code settings page
 │       └── isolation.js     per-feature scoped ctx, error boundaries, guarded callbacks, storage migration
