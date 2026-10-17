@@ -1375,11 +1375,9 @@ function settle(rows) {
   if (!ok.length) {
     return;
   }
-  const entries = snapshot(ok).map((e) => ({ ...e, pinWas: e.row.isPinned, unreadWas: Boolean(e.row.s.unread) }));
-  let written = {};
   parkAndNavigate(ok, () => {
     const now = Date.now();
-    written = writeRecs(
+    writeRecs(
       Object.fromEntries(
         ok.map((r) => [
           r.key,
@@ -1401,14 +1399,6 @@ function settle(rows) {
       if (r.s.unread) {
         setUnread(r, false);
       }
-    }
-  });
-  offerUndo(ok.length === 1 ? "Session settled" : `${plural(ok.length, "session")} settled`, entries, written, (e) => {
-    if (e.pinWas) {
-      setPinnedRaw(e.row, true);
-    }
-    if (e.unreadWas) {
-      setUnread(e.row, true);
     }
   });
 }
