@@ -710,22 +710,7 @@ async function fetchSessions(conn, includeCron, limit) {
     fetchSessionRows(limit, includeCron),
     inboxRest(`/outcomes?limit=${Math.min(1e4, limit)}`).catch(() => null)
   ]);
-  const before = new Map(cachedRows().map((s) => [keyOf(s), s]));
-  const sessions = roster.sessions.map((s) => {
-    const old = before.get(keyOf({ ...s, _conn: conn }));
-    const row = outcomes ? withOutcome(s, outcomes[profileOf(s)]?.[s.id]) : old ? { ...s, limit_reset_at: old.limit_reset_at, outcome: old.outcome, outcome_at: old.outcome_at, sent_at: old.sent_at } : s;
-    return { ...row, _conn: conn };
-  });
-  const readElsewhere = {};
-  for (const s of sessions) {
-    const old = before.get(keyOf(s));
-    if (old?.unread && s.unread === false) {
-      readElsewhere[keyOf(s)] = { visitedAt: Date.now() };
-    }
-  }
-  if (Object.keys(readElsewhere).length) {
-    writeRecs(readElsewhere);
-  }
+  const sessions = roster.sessions.map((s) => ({ ...withOutcome(s, outcomes?.[profileOf(s)]?.[s.id]), _conn: conn }));
   for (const s of sessions) {
     const o = pinOverlay.get(keyOf(s));
     if (o && typeof s.pinned === "boolean" && s.pinned === o.pinned) {
@@ -816,40 +801,6 @@ function markOwnerUnreachable(owner) {
     setOwnerLive(owner, { ...entry, stale: true });
   }
 }
-var IDLE_GRACE_MS = 7e3;
-function mergeTurnStarts(prev, fresh, statuses) {
-  const out = { ...fresh };
-  for (const id of Object.keys(prev?.turnStarts || {})) {
-    if (out[id] === void 0 && (statuses[id] === "working" || statuses[id] === "waiting")) {
-      out[id] = prev.turnStarts[id];
-    }
-  }
-  return out;
-}
-function holdLive(prev, statuses, runtime, background, delegationOk, now) {
-  const busyAt = {};
-  const backgroundAt = {};
-  const heldBackground = { ...background };
-  const ids = /* @__PURE__ */ new Set([...Object.keys(statuses), ...Object.keys(prev?.statuses || {}), ...Object.keys(background), ...Object.keys(prev?.background || {})]);
-  for (const id of ids) {
-    if (statuses[id] === "working" || statuses[id] === "waiting") {
-      busyAt[id] = now;
-    } else if (prev && (prev.statuses[id] === "working" || prev.statuses[id] === "waiting") && now - (prev.busyAt?.[id] || 0) < IDLE_GRACE_MS) {
-      statuses[id] = "working";
-      runtime[id] = runtime[id] || prev.runtime[id];
-      busyAt[id] = prev.busyAt?.[id] || now;
-    }
-    if ((background[id] || 0) > 0) {
-      backgroundAt[id] = now;
-    } else if (prev && (prev.background[id] || 0) > 0 && now - (prev.backgroundAt?.[id] || 0) < IDLE_GRACE_MS) {
-      heldBackground[id] = prev.background[id];
-      backgroundAt[id] = prev.backgroundAt?.[id] || now;
-    } else if (!delegationOk && prev?.backgroundAt?.[id]) {
-      backgroundAt[id] = prev.backgroundAt[id];
-    }
-  }
-  return { background: heldBackground, backgroundAt, busyAt };
-}
 async function pollOwner(owner, request) {
   const gen = connGeneration;
   let res;
@@ -873,39 +824,21 @@ async function pollOwner(owner, request) {
   const prev = $live.get().owners[owner];
   const statuses = {};
   const runtime = {};
-  const turnStarts = {};
-  const nativeBackground = {};
   for (const row of res?.sessions || []) {
     const stored = row.session_key || row.id;
     if (stored) {
       statuses[stored] = row.status;
       runtime[stored] = row.id;
-      if (row.background_tasks > 0) {
-        nativeBackground[stored] = row.background_tasks;
-      }
-      if (row.turn_started_at) {
-        turnStarts[stored] = row.turn_started_at * 1e3;
-      }
     }
   }
-  let background = {};
-  if (delegation) {
-    for (const child of delegation.active || []) {
-      const parent = child.owner_agent_session_id;
-      if (parent) {
-        background[parent] = (background[parent] || 0) + 1;
-      }
+  const background = {};
+  for (const child of delegation?.active || []) {
+    const parent = child.owner_agent_session_id;
+    if (parent) {
+      background[parent] = (background[parent] || 0) + 1;
     }
-  } else if (prev) {
-    background = { ...prev.delegated || prev.background };
-  }
-  const delegated = { ...background };
-  for (const [id, n] of Object.entries(nativeBackground)) {
-    background[id] = (background[id] || 0) + n;
   }
   const now = Date.now();
-  const held = holdLive(prev, statuses, runtime, background, delegation !== null, now);
-  background = held.background;
   const pending = {};
   const waitingSince = {};
   for (const [id, status] of Object.entries(statuses)) {
@@ -917,7 +850,7 @@ async function pollOwner(owner, request) {
       }
     }
   }
-  const next = { delegated, turnStarts: mergeTurnStarts(prev, turnStarts, statuses), background, backgroundAt: held.backgroundAt, busyAt: held.busyAt, pending, runtime, stale: false, statuses, waitingSince };
+  const next = { background, pending, runtime, stale: false, statuses, waitingSince };
   if (prev) {
     recordEdges(owner, prev, next);
   }
@@ -956,6 +889,7 @@ function resetSourceState() {
   connGeneration += 1;
   $live.set({ owners: {} });
   lastLiveOk.clear();
+  workingSince = /* @__PURE__ */ new Map();
   rowCache = /* @__PURE__ */ new Map();
   $selection.set({ anchor: null, keys: [] });
   void pullLifecycle();
@@ -1141,11 +1075,6 @@ async function runRecovery() {
 }
 var isFailure = (outcome) => outcome === "failed" || outcome === "limited";
 var BUSY = /* @__PURE__ */ new Set(["working"]);
-function turnStartFor(rec, s, now) {
-  const sent = Math.max(s.sent_at ? s.sent_at * 1e3 : 0, rec.sentAt || 0);
-  const ended = Math.max(rec.returnedAt || 0, s.outcome_at ? s.outcome_at * 1e3 : 0);
-  return sent && sent >= ended && sent <= now && now - sent < DAY ? sent : now;
-}
 function deriveRow(s, cx) {
   const { life, live: live2, prefs, now, focusedId, pinOrder } = cx;
   const key = keyOf(s);
@@ -1162,16 +1091,11 @@ function deriveRow(s, cx) {
   const backgroundCount = src ? ids.reduce((n, id) => n + (src.background[id] || 0), 0) : 0;
   const background = !busy && !waiting && backgroundCount > 0;
   const waitingSince = waiting ? find(src?.waitingSince) || now : null;
-  if (busy || background || waiting) {
+  if (busy || background) {
     if (!workingSince.has(key)) {
-      workingSince.set(key, find(src?.turnStarts) || turnStartFor(rec, s, now));
-    } else {
-      const server = find(src?.turnStarts);
-      if (server && server !== workingSince.get(key)) {
-        workingSince.set(key, server);
-      }
+      workingSince.set(key, Date.now());
     }
-  } else if (src && !src.stale) {
+  } else {
     workingSince.delete(key);
   }
   const outcome = s.outcome || null;
@@ -1487,9 +1411,7 @@ function patchSession(row, body) {
   });
 }
 function setUnread(rows, unread) {
-  const list = asList(rows);
-  writeRecs(Object.fromEntries(list.map((r) => [r.key, { visitedAt: unread ? null : Date.now() }])));
-  for (const row of list) {
+  for (const row of asList(rows)) {
     patchCachedRows((list) => list.map((s) => sameSession(s, row.s) ? { ...s, unread } : s));
     patchSession(row, { unread }).catch((err) => host.notifyError(err, "Could not update read state")).finally(refresh);
   }
@@ -1599,11 +1521,10 @@ function StatusLabel({ row, now }) {
         {
           className: "t3i-status t3i-c-info",
           "data-stale": stale,
-          title: staleTitle(row) || `${plural(row.backgroundCount, "background task")} still running`
+          title: staleTitle(row) || `${plural(row.backgroundCount, "delegated task")} still running`
         },
         h(Icon, { name: "users", size: 14 }),
-        h("b", { role: "status" }, "Background"),
-        row.stale ? null : h(WorkingTimer, { since: row.workingStartedAt })
+        h("b", { role: "status" }, "Background")
       );
     case "approval":
       return h(
@@ -3422,13 +3343,8 @@ var desktop_default = {
         $pinsVersion.set($pinsVersion.get() + 1);
       }
     });
-    let lastFocusedKey = null;
     ctx.onDispose(
       host.state.focusedStoredSessionId.subscribe((id) => {
-        if (lastFocusedKey) {
-          markVisited(lastFocusedKey);
-          lastFocusedKey = null;
-        }
         if (!id) {
           return;
         }
@@ -3438,8 +3354,7 @@ var desktop_default = {
           if (connOf(s) === "local") {
             openedProfiles.add(profileOf(s));
           }
-          lastFocusedKey = keyOf(s);
-          markVisited(lastFocusedKey);
+          markVisited(keyOf(s));
         }
       })
     );

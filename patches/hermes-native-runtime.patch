@@ -1141,7 +1141,7 @@ index 0000000000..e984c5a8cb
 +as `/<slash_namespace>:<name>` (the profile attribute; default: the provider name).
 +The listing runs per keystroke, so it must answer from a cache.
 diff --git a/tui_gateway/server.py b/tui_gateway/server.py
-index 849d42b..b9cc92a 100644
+index 849d42bfda..bb2126e3cb 100644
 --- a/tui_gateway/server.py
 +++ b/tui_gateway/server.py
 @@ -2209,6 +2209,10 @@ def _get_usage(agent) -> dict:
@@ -1155,3 +1155,29 @@ index 849d42b..b9cc92a 100644
      # Cache-hit ratio + rolling latency/tps (CLI status-bar parity). Omitted, not fabricated, when there is no
      # data (Codex reports no latency; zero cache reads shows no hit% rather than an alarming 0).
      with contextlib.suppress(Exception):
+@@ -3059,6 +3063,15 @@ def _session_live_title(session: dict, key: str) -> str:
+     return title
+ 
+ 
++def _native_background_tasks(session: dict) -> int:
++    """Native-runtime work (background shells, monitors, subagents) that will wake the conversation again."""
++    count = getattr(getattr(session.get("agent"), "_native_runtime", None), "background_task_count", None)
++    try:
++        return int(count()) if callable(count) else 0
++    except Exception:
++        return 0
++
++
+ def _session_live_item(sid: str, session: dict, current_sid: str = "") -> dict:
+     key = _session_lookup_key(session, fallback=sid)
+     agent = session.get("agent")
+@@ -3079,7 +3092,8 @@ def _session_live_item(sid: str, session: dict, current_sid: str = "") -> dict:
+         "message_count": len(history),
+         "model": str(getattr(agent, "model", "") or _resolve_model()), "preview": preview,
+         "session_key": key, "started_at": float(session.get("created_at") or now), "status": status,
+-        "title": _session_live_title(session, key),
++        "title": _session_live_title(session, key), "turn_started_at": _turn_started_at(session),
++        "background_tasks": _native_background_tasks(session),
+     }
+ 
+ 

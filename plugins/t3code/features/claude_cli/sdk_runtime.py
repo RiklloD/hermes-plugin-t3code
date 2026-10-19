@@ -99,6 +99,17 @@ class ClaudeRuntime(NativeAgentRuntime):
         from .t3_bridge import server as t3_server
         if (t3 := t3_server()) is not None:
             options.mcp_servers = {**(options.mcp_servers if isinstance(options.mcp_servers, dict) else {}), "t3": t3}
+        from . import cup_bridge
+        try:
+            cup = cup_bridge.server()
+        except Exception:
+            # Optional: a broken computer-use bridge must not take the native session down with it.
+            logging.getLogger("t3code.claude").warning("computer-use bridge unavailable", exc_info=True)
+            cup = None
+        if cup is not None:
+            options.mcp_servers = {**(options.mcp_servers if isinstance(options.mcp_servers, dict) else {}),
+                                   cup_bridge.SERVER: cup}
+            options.allowed_tools = [*(getattr(options, "allowed_tools", None) or []), *cup_bridge.preapproved()]
         from contextlib import AsyncExitStack
         from .model_selection import context_policy, launch_model
         policy = context_policy("default", self.settings)
@@ -160,6 +171,8 @@ class ClaudeRuntime(NativeAgentRuntime):
                         break
                     finally:
                         self._interrupt_pending.clear()
+                        if cup is not None:
+                            await asyncio.to_thread(cup_bridge.turn_ended)
                         events.put(None)
                         self._active_events = None
             finally:
