@@ -65,6 +65,7 @@ The native providers take over a whole chat turn through Hermes's native-agent-r
 - small hooks in `agent_init`, `agent_runtime_helpers`, `turn_facade`, `run_agent`, manual compression and session auto-continue
 - `agent/native_commands.py` (new): the native agents' own slash commands in Hermes's slash menu
 - `website/docs/developer-guide/plugins/agent-runtime-plugin.md`
+- `apps/desktop/.../thread/status.tsx`: the turn timer counts the whole turn instead of restarting at 0 whenever a native tool call lands (desktop source only; takes effect when Hermes Desktop is rebuilt from source)
 
 Apply manually with:
 

@@ -1181,3 +1181,42 @@ index 849d42bfda..bb2126e3cb 100644
      }
  
  
+diff --git a/apps/desktop/src/components/assistant-ui/thread/status.tsx b/apps/desktop/src/components/assistant-ui/thread/status.tsx
+index 46297cc61f..c5c32d2623 100644
+--- a/apps/desktop/src/components/assistant-ui/thread/status.tsx
++++ b/apps/desktop/src/components/assistant-ui/thread/status.tsx
+@@ -359,10 +359,10 @@ const TurnActivityRow: FC<TurnActivityRowProps> = ({ active, elapsed, hint, loca
+ // border and Stop button are lit through all of it; the transcript used to be
+ // silent for most of it, and those seconds went uncounted.
+ //
+-// So this row follows the SAME busy signal the composer does, and times every
+-// gap from the moment the turn last showed something rather than from its own
+-// mount. What it doesn't do is double-narrate: a tool call in flight already
+-// carries its own row and timer.
++// So this row follows the SAME busy signal the composer does. The gaps decide
++// when it appears; what it counts is the whole turn, so nothing mid-turn can
++// restart it. What it doesn't do is double-narrate: a tool call in flight
++// already carries its own row and timer.
+ //
+ // Subscribes to the activity signal ITSELF (rather than taking it as a prop)
+ // so that per-token updates re-render only this leaf, not the whole
+@@ -423,14 +423,11 @@ export const TurnActivityIndicator: FC<{ thinking?: boolean }> = ({ thinking = f
+   const active =
+     working && !awaitingInput && !toolNarrating && (Boolean(hint) || localLoad !== null || quietSince !== undefined)
+ 
+-  // Compaction owns the whole turn, so it keeps counting from the turn's start;
+-  // anything else counts from the moment the turn last produced something — the
+-  // gap's own mark, or the draft's, whichever named the wait first.
+-  const elapsed = useElapsedSeconds(
+-    active,
+-    undefined,
+-    compacting ? turnStartedAt : (quietSince ?? drafting?.since ?? turnStartedAt)
+-  )
++  // The count is the whole turn's, from the store-held start the pre-first-token
++  // row and the status bar also read. Counting from the quiet mark restarted it
++  // at 0 every time a tool call landed (every few seconds on a tool-heavy turn)
++  // and on every remount; the quiet mark only decides WHEN the row shows.
++  const elapsed = useElapsedSeconds(active, undefined, turnStartedAt ?? drafting?.since)
+ 
+   // Once the row has been shown, keep its live region mounted across
+   // quiet/working flips: remounting a role="status" node makes screen readers
