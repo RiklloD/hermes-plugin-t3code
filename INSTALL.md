@@ -41,7 +41,7 @@ command -v git >/dev/null
   anyway — without the patch the three native providers (Claude CLI, Muse Code, Antigravity)
   cannot run.
 - Record the Hermes commit. It is expected to be the `hermes_base_commit` in `SOURCE.json`
-  (`1fd18277267152893a8a24792b79213e7ca3f899`). A different commit is not an automatic failure,
+  (`9cb34e9e285dadd0c6d2463e9b094052530fc365`). A different commit is not an automatic failure,
   but Step 2 decides.
 
 ## Step 2 — Host patch (required, idempotent)
@@ -58,8 +58,8 @@ git -C "$AGENT" apply "$PATCH"
 Failure handling:
 
 - If `--check` fails: run `git -C "$AGENT" apply --3way "$PATCH"`. If that leaves conflicts,
-  STOP. Report the conflicted files and tell the user the patch (15 files, targets the commit
-  in `SOURCE.json`) no longer matches their Hermes version and needs porting. MUST NOT hand-edit
+  STOP. Report the conflicted files and tell the user the patch targets the commit
+  in `SOURCE.json` no longer matches their Hermes version and needs porting. MUST NOT hand-edit
   Hermes files to make it fit.
 - Note for the user: an unrelated Z.ai 429/1311 fix that may exist on the author's machine is
   deliberately NOT in this patch. Do not add it.

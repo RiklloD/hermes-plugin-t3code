@@ -14,6 +14,8 @@ T3 Code's features for [Hermes Agent](https://github.com/NousResearch/hermes-age
 
 ## Latest changes
 
+- **Updated Hermes compatibility:** the host patch is rebased onto `9cb34e9e285dadd0c6d2463e9b094052530fc365`, preserving the new command-discovery/session-registry split and credential-route snapshots. Native turn timing and background-task fields are included in the gateway contracts.
+
 - **Inbox thread mentions:** drag one thread or a selection onto a chat composer to insert `@session:` mentions, or type `@` to search the Inbox roster. Drops target the composer they land on, including tiled chats. The prebuilt Desktop bundle includes this feature.
 - **Muse staged approvals:** each requirement gets its own permission prompt and exact decision payload; duplicate notifications are suppressed and stale answers are ignored after interruption, stage advancement, completion, or turn replacement. No stages are automatically approved. This adapter fix does not repair existing Muse approval-replay failures or rewrite session history.
 
@@ -51,7 +53,7 @@ Model lists come from your accounts: Muse lists its models live; Antigravity lis
 
 ## Requirements
 
-- Hermes Agent `>=0.21.5` with the Desktop app (host patch verified against hermes-agent `1fd18277267152893a8a24792b79213e7ca3f899`)
+- Hermes Agent `>=0.21.5` with the Desktop app (host patch verified against hermes-agent `9cb34e9e285dadd0c6d2463e9b094052530fc365`)
 - Python 3.11–3.14 (Hermes's own environment)
 - Optional, per provider: `claude` CLI, `muse` CLI, Google account for Antigravity
 - Node + Hermes's `esbuild` only if you rebuild the Desktop bundle: `node plugins/t3code/scripts/build.mjs`
@@ -73,7 +75,7 @@ Apply manually with:
 git -C ~/.hermes/hermes-agent apply patches/hermes-native-runtime.patch
 ```
 
-If it no longer applies cleanly after a Hermes update, try `git apply --3way`, or port the diff — it is intentionally small (15 files, ~950 lines, including the native slash-command seam). An unrelated Z.ai 429/1311 entitlement fix from the author's machine is **not** included.
+If it no longer applies cleanly after a Hermes update, try `git apply --3way`, or port the diff. The patch preserves the current shared command-discovery and session-registry layout and declares native activity fields in the generated gateway contracts. An unrelated Z.ai 429/1311 entitlement fix from the author's machine is **not** included.
 
 ## Layout
 
