@@ -1059,8 +1059,13 @@ function markOwnerUnreachable(owner) {
   }
 }
 
-async function pollOwner(owner, request) {
+async function pollOwner(owner, unscoped) {
   const gen = connGeneration
+  // Name the profile on every call: Desktop now serves secondary profiles over
+  // the default profile's shared socket, which answers for its own home unless
+  // told otherwise (the default profile's turns showed up as this one's).
+  const profile = owner.slice(owner.indexOf('|') + 1)
+  const request = (m, p) => unscoped(m, { ...p, profile })
   let res
   let delegation
 
@@ -1453,6 +1458,9 @@ const isFailure = outcome => outcome === 'failed' || outcome === 'limited'
 // Hermes also reports 'starting' for read-only resume/prewarm. Only an actual
 // turn is work: opening a thread must not fake a send, completion or shelf move.
 const BUSY = new Set(['working'])
+// Sources started on this machine get no badge; only messaging platforms do.
+// Hermes 0.22 renamed 'desktop' to 'gui' and added 'local' for Desktop chats.
+const LOCAL_SOURCES = new Set(['tui', 'desktop', 'gui', 'local', 'cli', 'api'])
 
 function deriveRow(s, cx) {
   const { life, live, prefs, now, focusedId, pinOrder } = cx
@@ -2428,7 +2436,7 @@ const CardRow = memo(function CardRow({ row, section, drag, dragging, dropBefore
             hasDraft && !row.isActive ? h(DraftMark) : null,
             h(ProfileMark, { profile: s.profile }),
             h('span', { className: 't3i-proj' }, s.profile || 'default'),
-            s.handoff_platform || (s.source && !['tui', 'desktop', 'cli', 'api'].includes(s.source))
+            s.handoff_platform || (s.source && !LOCAL_SOURCES.has(s.source))
               ? h('span', { className: 't3i-src' }, s.handoff_platform || s.source)
               : null,
             row.isPinned

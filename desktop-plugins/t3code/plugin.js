@@ -801,8 +801,10 @@ function markOwnerUnreachable(owner) {
     setOwnerLive(owner, { ...entry, stale: true });
   }
 }
-async function pollOwner(owner, request) {
+async function pollOwner(owner, unscoped) {
   const gen = connGeneration;
+  const profile = owner.slice(owner.indexOf("|") + 1);
+  const request = (m, p) => unscoped(m, { ...p, profile });
   let res;
   let delegation;
   try {
@@ -1075,6 +1077,7 @@ async function runRecovery() {
 }
 var isFailure = (outcome) => outcome === "failed" || outcome === "limited";
 var BUSY = /* @__PURE__ */ new Set(["working"]);
+var LOCAL_SOURCES = /* @__PURE__ */ new Set(["tui", "desktop", "gui", "local", "cli", "api"]);
 function deriveRow(s, cx) {
   const { life, live: live2, prefs, now, focusedId, pinOrder } = cx;
   const key = keyOf(s);
@@ -1839,7 +1842,7 @@ var CardRow = memo(function CardRow2({ row, section, drag, dragging, dropBefore,
             hasDraft && !row.isActive ? h(DraftMark) : null,
             h(ProfileMark, { profile: s.profile }),
             h("span", { className: "t3i-proj" }, s.profile || "default"),
-            s.handoff_platform || s.source && !["tui", "desktop", "cli", "api"].includes(s.source) ? h("span", { className: "t3i-src" }, s.handoff_platform || s.source) : null,
+            s.handoff_platform || s.source && !LOCAL_SOURCES.has(s.source) ? h("span", { className: "t3i-src" }, s.handoff_platform || s.source) : null,
             row.isPinned ? h(
               Tip,
               { label: "Unpin session" },
