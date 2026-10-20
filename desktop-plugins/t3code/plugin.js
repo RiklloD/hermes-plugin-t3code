@@ -5239,7 +5239,8 @@ function GoalStrip() {
     queryKey: [QUERY2, owner?.connectionId, owner?.profile, sessionId, runtimeId],
     queryFn: () => fetchGoal(owner, sessionId, runtimeId),
     enabled: Boolean(sessionId && owner?.connectionId && owner?.profile),
-    refetchInterval: 2500,
+    // Back off while the backend errors (e.g. 503) instead of hammering it every 2.5s.
+    refetchInterval: (q) => q.state.status === "error" ? 3e4 : 2500,
     staleTime: 1e3,
     retry: 1
   });

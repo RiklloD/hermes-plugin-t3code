@@ -171,8 +171,20 @@ def guarded(key: str, part: str, fn: Callable[[], Any]) -> bool:
 
 # ── loading feature code ───────────────────────────────────────────────────────────────────────
 
+# The plugin host serves each dashboard request on its own thread, so several can import
+# plugin_api.py at once; without this lock one thread sees another's half-executed module
+# (no ``router`` yet) and the feature is cached as failed until restart. Reentrant: feature
+# modules load each other while importing.
+_load_lock = threading.RLock()
+
+
 def load_feature_module(key: str, filename: str) -> ModuleType:
     """Import ``features/<key>/<filename>`` under a stable private module name (once per process)."""
+    with _load_lock:
+        return _load_feature_module(key, filename)
+
+
+def _load_feature_module(key: str, filename: str) -> ModuleType:
     name = f"t3code_{key}_{Path(filename).stem}"
     mod = sys.modules.get(name)
     if mod is not None:

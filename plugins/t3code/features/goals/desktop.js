@@ -63,7 +63,8 @@ export function GoalStrip() {
     queryKey: [QUERY, owner?.connectionId, owner?.profile, sessionId, runtimeId],
     queryFn: () => fetchGoal(owner, sessionId, runtimeId),
     enabled: Boolean(sessionId && owner?.connectionId && owner?.profile),
-    refetchInterval: 2500, staleTime: 1000, retry: 1
+    // Back off while the backend errors (e.g. 503) instead of hammering it every 2.5s.
+    refetchInterval: q => (q.state.status === 'error' ? 30_000 : 2500), staleTime: 1000, retry: 1
   })
   // No provider/model/busy check: keep the objective visible between turns,
   // while native background tasks run, and when the model/harness changes.

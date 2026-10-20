@@ -1228,3 +1228,123 @@ index 0000000000..e984c5a8cb
 +name Hermes already owns keeps its Hermes meaning, and the native command is offered
 +as `/<slash_namespace>:<name>` (the profile attribute; default: the provider name).
 +The listing runs per keystroke, so it must answer from a cache.
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 1eac74c94c..cb5b92d722 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -541,7 +541,7 @@ import {
+ import { enableRendererAccessibility } from './renderer-accessibility'
+ import { missingRendererAssets, presentRendererIndexes } from './renderer-bundle'
+ import { planLaunchSwitches, readDesktopLaunchConfig } from './renderer-heap-flags'
+-import { loadRendererLoadErrorPage } from './renderer-load-error-page'
++import { loadRendererLoadErrorPage, RENDERER_RELOAD_SENTINEL_URL } from './renderer-load-error-page'
+ import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
+ import { fetchRosterSourceData } from './roster-source-fetch'
+ import { rosterSourceStatus } from './roster-source-status'
+@@ -12332,6 +12332,14 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
+       return
+     }
+ 
++    // Recovery page's Reload button (see RENDERER_RELOAD_SENTINEL_URL).
++    if (url.startsWith(RENDERER_RELOAD_SENTINEL_URL)) {
++      event.preventDefault()
++      void win.loadURL(DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString()).catch(() => {})
++
++      return
++    }
++
+     event.preventDefault()
+     void openExternalUrl(url)
+   })
+diff --git a/apps/desktop/electron/renderer-load-error-page.test.ts b/apps/desktop/electron/renderer-load-error-page.test.ts
+index e2b6011345..59b75484fc 100644
+--- a/apps/desktop/electron/renderer-load-error-page.test.ts
++++ b/apps/desktop/electron/renderer-load-error-page.test.ts
+@@ -26,9 +26,9 @@ test('error page reload button targets the real renderer URL when provided', ()
+     reloadUrl: 'file:///C:/Hermes%20Agent/dist/index.html'
+   })
+ 
+-  // A data: page cannot recover with location.reload() (it would re-render
+-  // the error page) — the button must navigate back to the app URL.
+-  assert.match(html, /location\.replace\("file:\/\/\/C:\/Hermes%20Agent\/dist\/index\.html"\)/)
++  // A data: page cannot recover with location.reload() (it would re-render the error page),
++  // and Chromium blocks data: → file:, so a file: target goes through main's reload sentinel.
++  assert.match(html, /location\.replace\("https:\/\/hermes-desktop-reload\.invalid\/"\)/)
+   assert.doesNotMatch(html, /location\.reload\(\)/)
+ })
+ 
+@@ -49,7 +49,7 @@ test('reloadUrl cannot break out of the inline script block', () => {
+   // element and inject markup/script into the error page.
+   const html = buildRendererLoadErrorPage({
+     errorDescription: 'load failed',
+-    reloadUrl: 'file:///C:/x/index.html</script><script>alert("pwned")</script>'
++    reloadUrl: 'http://localhost:5173/</script><script>alert("pwned")</script>'
+   })
+ 
+   assert.doesNotMatch(html, /<\/script><script>/)
+diff --git a/apps/desktop/electron/renderer-load-error-page.ts b/apps/desktop/electron/renderer-load-error-page.ts
+index d701ab5878..3a676ed9b2 100644
+--- a/apps/desktop/electron/renderer-load-error-page.ts
++++ b/apps/desktop/electron/renderer-load-error-page.ts
+@@ -60,10 +60,16 @@ function escapeInlineScriptJson(value: string): string {
+     .replace(/\u2029/g, '\\u2029')
+ }
+ 
++/**
++ * Chromium refuses a data: page navigating to file:// ("Not allowed to load local resource"),
++ * so a file: reloadUrl goes through this sentinel instead: main's will-navigate handler cancels
++ * it and loads the renderer itself.
++ */
++export const RENDERER_RELOAD_SENTINEL_URL = 'https://hermes-desktop-reload.invalid/'
++
+ function reloadButtonJs(details: RendererLoadErrorDetails): string {
+-  const target = details.reloadUrl
+-    ? `location.replace(${escapeInlineScriptJson(JSON.stringify(details.reloadUrl))})`
+-    : 'location.reload()'
++  const href = details.reloadUrl?.startsWith('file:') ? RENDERER_RELOAD_SENTINEL_URL : details.reloadUrl
++  const target = href ? `location.replace(${escapeInlineScriptJson(JSON.stringify(href))})` : 'location.reload()'
+ 
+   return (
+     '<button id="reload" type="button">Reload</button>\n' +
+diff --git a/apps/desktop/electron/window-renderer-lifecycle.test.ts b/apps/desktop/electron/window-renderer-lifecycle.test.ts
+index 599a3a396b..ed1d5b0a65 100644
+--- a/apps/desktop/electron/window-renderer-lifecycle.test.ts
++++ b/apps/desktop/electron/window-renderer-lifecycle.test.ts
+@@ -103,6 +103,10 @@ test('shouldReloadAfterRendererGone never reloads expected teardown or unknown r
+     reload: false,
+     suppressedReason: 'expected-teardown'
+   })
++  // A live window's renderer exiting 0 is not a normal shutdown — reload it.
++  assert.deepEqual(shouldReloadAfterRendererGone({ reason: 'clean-exit', isDestroyed: false, recentReloadTimes: [] }), {
++    reload: true
++  })
+   assert.deepEqual(
+     shouldReloadAfterRendererGone({ reason: 'launch-failed', isDestroyed: false, recentReloadTimes: [] }),
+     {
+diff --git a/apps/desktop/electron/window-renderer-lifecycle.ts b/apps/desktop/electron/window-renderer-lifecycle.ts
+index 091d137c1b..75f6defb36 100644
+--- a/apps/desktop/electron/window-renderer-lifecycle.ts
++++ b/apps/desktop/electron/window-renderer-lifecycle.ts
+@@ -17,8 +17,8 @@
+ //   `isIntentionalTeardown` (expected teardown). Once the budget is spent, a
+ //   live window hands off to `onRendererTerminated` so it ends on a visible
+ //   recovery affordance rather than a dead window.
+-// - `render-process-gone` with other reasons (`launch-failed`, `clean-exit`,
+-//   unknown) → log only.
++// - `render-process-gone` with `clean-exit` on a live window → same bounded reload.
++// - `render-process-gone` with other reasons (`launch-failed`, unknown) → log only.
+ // - `unresponsive` → log only (no reload; Chromium usually follows with
+ //   render-process-gone, and forcing a reload while the main thread is wedged
+ //   can make things worse).
+@@ -133,7 +133,10 @@ export interface LifecycleWindowLike {
+ const DEFAULT_RELOAD_WINDOW_MS = 60_000
+ const DEFAULT_RELOAD_MAX = 3
+ 
+-const RECOVERABLE_REASONS = new Set(['crashed', 'oom', 'killed'])
++// `clean-exit` on a LIVE window is not a normal shutdown (teardown short-circuits first via
++// isDestroyed/isIntentionalTeardown): macOS can end a renderer with exit 0 under app-nap/memory
++// pressure, which used to strand the user on the recovery page. Reload it under the same budget.
++const RECOVERABLE_REASONS = new Set(['crashed', 'oom', 'killed', 'clean-exit'])
+ 
+ function safeNow(now: (() => number) | undefined): number {
+   return typeof now === 'function' ? now() : Date.now()
