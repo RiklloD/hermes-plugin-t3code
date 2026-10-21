@@ -4251,14 +4251,28 @@ export default {
     ctx.setInterval(() => !document.hidden && syncDrafts(), 1_000)
     syncDrafts()
 
-    // A different connection or gateway profile invalidates what we knew about the old one.
-    let lastSource = `${activeConn()}|${activeProfile()}`
+    // A different connection invalidates what we knew about the old one. A
+    // profile swap on the same connection does not: live state is keyed per
+    // owner (conn|profile), and New thread / opening another profile's thread
+    // flips the active profile, so wiping here blanked every working row until
+    // the next poll. Keep it, keep polling the profile we left, poll now.
+    let lastConn = activeConn()
+    let lastProfile = activeProfile()
     const onSource = () => {
-      const source = `${activeConn()}|${activeProfile()}`
+      const conn = activeConn()
+      const profile = activeProfile()
 
-      if (source !== lastSource) {
-        lastSource = source
+      if (conn !== lastConn) {
+        lastConn = conn
+        lastProfile = profile
         resetSourceState()
+      } else if (profile !== lastProfile) {
+        if (conn === 'local') {
+          openedProfiles.add(lastProfile)
+        }
+
+        lastProfile = profile
+        void pollLive()
       }
     }
     ctx.onDispose(host.state.connectionId.subscribe(onSource))

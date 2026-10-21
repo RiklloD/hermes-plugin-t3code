@@ -3307,12 +3307,21 @@ var desktop_default = {
     });
     ctx.setInterval(() => !document.hidden && syncDrafts(), 1e3);
     syncDrafts();
-    let lastSource = `${activeConn()}|${activeProfile()}`;
+    let lastConn = activeConn();
+    let lastProfile = activeProfile();
     const onSource = () => {
-      const source = `${activeConn()}|${activeProfile()}`;
-      if (source !== lastSource) {
-        lastSource = source;
+      const conn = activeConn();
+      const profile = activeProfile();
+      if (conn !== lastConn) {
+        lastConn = conn;
+        lastProfile = profile;
         resetSourceState();
+      } else if (profile !== lastProfile) {
+        if (conn === "local") {
+          openedProfiles.add(lastProfile);
+        }
+        lastProfile = profile;
+        void pollLive();
       }
     };
     ctx.onDispose(host.state.connectionId.subscribe(onSource));
