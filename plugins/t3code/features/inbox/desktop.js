@@ -1707,8 +1707,15 @@ function openRow(row, intent) {
     openedProfiles.add(profileOf(row.s))
   }
 
+  // forceResume = the sidebar's requestSessionResume: without it a chat already
+  // cached in the renderer paints its stale snapshot, and a fork taken from that
+  // view is cut at the last message it showed (turns behind the real thread).
   host
     .openSession(row.s.id, {
+      awaitHydration: true,
+      expectHistory: (row.s.message_count || 0) > 0,
+      forceResume: true,
+      retryHydrationTimeoutOnce: true,
       ...(row.s.profile ? { profile: row.s.profile } : {}),
       ...(intent ? { intent } : {})
     })

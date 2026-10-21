@@ -1246,6 +1246,10 @@ function openRow(row, intent) {
     openedProfiles.add(profileOf(row.s));
   }
   host.openSession(row.s.id, {
+    awaitHydration: true,
+    expectHistory: (row.s.message_count || 0) > 0,
+    forceResume: true,
+    retryHydrationTimeoutOnce: true,
     ...row.s.profile ? { profile: row.s.profile } : {},
     ...intent ? { intent } : {}
   }).then(() => markVisited(row.key)).catch((err) => host.notifyError(err, "Could not open session"));
