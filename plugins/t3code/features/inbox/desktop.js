@@ -1090,18 +1090,23 @@ async function pollOwner(owner, unscoped) {
   const prev = $live.get().owners[owner]
   const statuses = {}
   const runtime = {}
+  // Delegated children and native background work (Claude Code shells, monitors,
+  // subagents) that outlive their parent's turn keep it working.
+  const background = {}
 
   for (const row of res?.sessions || []) {
     const stored = row.session_key || row.id
 
     if (stored) {
-      statuses[stored] = row.status
+      // A sent turn reports 'starting' while its agent is still being built: that is work.
+      statuses[stored] = row.status === 'starting' && row.turn_started_at ? 'working' : row.status
       runtime[stored] = row.id
+
+      if (row.background_tasks > 0) {
+        background[stored] = (background[stored] || 0) + row.background_tasks
+      }
     }
   }
-
-  // Delegated children that outlive their parent's turn keep it working.
-  const background = {}
 
   for (const child of delegation?.active || []) {
     const parent = child.owner_agent_session_id

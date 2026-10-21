@@ -826,14 +826,17 @@ async function pollOwner(owner, unscoped) {
   const prev = $live.get().owners[owner];
   const statuses = {};
   const runtime = {};
+  const background = {};
   for (const row of res?.sessions || []) {
     const stored = row.session_key || row.id;
     if (stored) {
-      statuses[stored] = row.status;
+      statuses[stored] = row.status === "starting" && row.turn_started_at ? "working" : row.status;
       runtime[stored] = row.id;
+      if (row.background_tasks > 0) {
+        background[stored] = (background[stored] || 0) + row.background_tasks;
+      }
     }
   }
-  const background = {};
   for (const child of delegation?.active || []) {
     const parent = child.owner_agent_session_id;
     if (parent) {
@@ -4919,6 +4922,7 @@ import React4 from "react";
 import * as sdk4 from "@hermes/plugin-sdk";
 var {
   host: host4,
+  atom: atom4,
   useValue: useValue4,
   useQuery: useQuery4,
   queryClient: queryClient4,
@@ -4933,6 +4937,7 @@ var h4 = React4.createElement;
 var QUERY = "t3code-claude-context";
 var ACCOUNTS_QUERY = "t3code-claude-accounts";
 var featureCtx = null;
+var $showAccounts = atom4(true);
 var CLAUDE_PROVIDERS = ["claude-cli", "claude-cli-2"];
 function hasNativeMillion(model) {
   const match = model.match(/^claude-(opus|sonnet|haiku|fable)-(\d+)(?:-(\d+))?$/);
@@ -5084,11 +5089,41 @@ function AccountsPanel() {
     )
   );
 }
+function AccountsSlot() {
+  return useValue4($showAccounts) ? h4(AccountsPanel) : null;
+}
+function SettingsPage3() {
+  const show = useValue4($showAccounts);
+  return h4(
+    "label",
+    { style: { display: "flex", gap: 8, alignItems: "flex-start", padding: 4 } },
+    h4("input", {
+      type: "checkbox",
+      checked: show,
+      onChange: (e) => {
+        $showAccounts.set(e.target.checked);
+        featureCtx.storage.set("showAccounts", e.target.checked);
+      }
+    }),
+    h4(
+      "span",
+      null,
+      "Show Claude accounts in the status bar",
+      h4(
+        "div",
+        { style: { fontSize: 12, color: "var(--ui-text-tertiary)" } },
+        'The "Claude" button listing account A and B sign-in status. The 200K/1M context picker stays either way.'
+      )
+    )
+  );
+}
 var desktop_default4 = {
   register(ctx) {
     featureCtx = ctx;
+    $showAccounts = atom4(ctx.storage.get("showAccounts", true) !== false);
     ctx.register({ id: "context-window", area: "statusBar.right", order: -10, render: () => h4(ContextPicker) });
-    ctx.register({ id: "claude-accounts", area: "statusBar.right", order: -9, render: () => h4(AccountsPanel) });
+    ctx.register({ id: "claude-accounts", area: "statusBar.right", order: -9, render: () => h4(AccountsSlot) });
+    ctx.registerSettingsPage?.({ icon: "user", id: "settings", render: () => h4(SettingsPage3), title: "Claude CLI" });
     ctx.onEvent("session.info", () => {
       void queryClient4.invalidateQueries({ queryKey: [QUERY] });
     });
@@ -5466,7 +5501,7 @@ function featureContext(ctx, feature, entry, { report, settings: settings2 }) {
 }
 
 // shared/desktop/shell.js
-var { host: host7, atom: atom4, useValue: useValue6, ToggleRow: ToggleRow2, ListRow: ListRow2, Button: Button3 } = sdk5;
+var { host: host7, atom: atom5, useValue: useValue6, ToggleRow: ToggleRow2, ListRow: ListRow2, Button: Button3 } = sdk5;
 var h7 = React7.createElement;
 var PLUGIN_ID = "t3code";
 var TOGGLE_POLL_MS = 3e4;
@@ -5713,9 +5748,9 @@ var shell_default = {
     pages = /* @__PURE__ */ new Map();
     disposeSettings = null;
     settingsQueued = false;
-    $toggles = atom4({ inbox: true, usage: true, orchestrator: true, claude_cli: true, muse_code: true, antigravity: true, ...ctx.storage.get("toggles", {}) });
-    $remote = atom4({ at: 0, error: null, features: null });
-    $local = atom4({});
+    $toggles = atom5({ inbox: true, usage: true, orchestrator: true, claude_cli: true, muse_code: true, antigravity: true, ...ctx.storage.get("toggles", {}) });
+    $remote = atom5({ at: 0, error: null, features: null });
+    $local = atom5({});
     ctx.onDispose(() => {
       for (const key of [...live.keys()]) {
         stopFeature(key);

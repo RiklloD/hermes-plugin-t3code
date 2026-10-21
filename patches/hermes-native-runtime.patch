@@ -59,6 +59,44 @@ index 59006475de..2e4e7165e7 100644
  
  
  __all__ = ["init_agent"]
+diff --git a/agent/agent_init_snapshot.py b/agent/agent_init_snapshot.py
+new file mode 100644
+index 0000000000..f398a20a5b
+--- /dev/null
++++ b/agent/agent_init_snapshot.py
+@@ -0,0 +1,32 @@
++"""Initial primary-route restoration snapshot."""
++
++def snapshot_primary_runtime(agent):
++    # Per-turn restoration snapshot: after a fallback, the next turn restores these so the
++    # preferred model gets a fresh attempt.
++    _cc = agent.context_compressor
++    agent._primary_runtime = {
++        "model": agent.model,
++        "provider": agent.provider,
++        "requested_provider": agent.requested_provider,
++        "base_url": agent.base_url,
++        "api_mode": agent.api_mode,
++        "api_key": getattr(agent, "api_key", ""),
++        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
++        "client_kwargs": dict(agent._client_kwargs),
++        "use_prompt_caching": agent._use_prompt_caching,
++        "use_native_cache_layout": agent._use_native_cache_layout,
++        "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
++        # Engine state _try_activate_fallback() overwrites (getattr: plugin engines may lack them).
++        "compressor_model": getattr(_cc, "model", agent.model),
++        "compressor_base_url": getattr(_cc, "base_url", agent.base_url),
++        "compressor_api_key": getattr(_cc, "api_key", ""),
++        "compressor_provider": getattr(_cc, "provider", agent.provider),
++        "compressor_context_length": _cc.context_length,
++        "compressor_threshold_tokens": _cc.threshold_tokens,
++    }
++    if agent.api_mode == "anthropic_messages":
++        agent._primary_runtime.update({
++            "anthropic_api_key": agent._anthropic_api_key,
++            "anthropic_base_url": agent._anthropic_base_url,
++            "is_anthropic_oauth": agent._is_anthropic_oauth,
++        })
 diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
 index 36f9d4b982..fb0e835fec 100644
 --- a/agent/agent_runtime_helpers.py
@@ -115,6 +153,32 @@ index 36f9d4b982..fb0e835fec 100644
  
  
  def _pre_tool_block_message(agent, function_name, function_args, effective_task_id, tool_call_id, middleware_trace):
+diff --git a/agent/agent_runtime_helpers_billing.py b/agent/agent_runtime_helpers_billing.py
+new file mode 100644
+index 0000000000..b05b650f93
+--- /dev/null
++++ b/agent/agent_runtime_helpers_billing.py
+@@ -0,0 +1,20 @@
++"""Durable billing route after a deliberate model switch."""
++
++import logging
++
++logger = logging.getLogger(__name__)
++
++def persist_switch_billing_route(agent) -> None:
++    """Persist the billing route so dashboard Model cards show the post-switch provider."""
++    # _session_db / session_id may be unset (tests, bare agents).
++    session_db = getattr(agent, "_session_db", None)
++    session_id = getattr(agent, "session_id", None)
++    if session_db is None or not session_id:
++        return
++    try:
++        session_db.update_session_billing_route(
++            session_id, provider=agent.provider, base_url=agent.base_url,
++            billing_mode=getattr(agent, "api_mode", None),
++        )
++    except Exception:
++        logger.warning("Failed to persist billing route after model switch", exc_info=True)
 diff --git a/agent/context_breakdown.py b/agent/context_breakdown.py
 index 6d9fedec6c..6499d8ce2e 100644
 --- a/agent/context_breakdown.py
@@ -224,6 +288,488 @@ index af647a1c4f..38c71cf79c 100644
  
          _native_steer = _ic_codex_method(self, "request_steer")
          if _native_steer is not None:
+diff --git a/agent/native_commands.py b/agent/native_commands.py
+new file mode 100644
+index 0000000000..514b91a2ae
+--- /dev/null
++++ b/agent/native_commands.py
+@@ -0,0 +1,121 @@
++"""Slash commands a native agent runtime brings with it (Claude Code's ``/review``, a Muse skill, an ACP ``/plan``).
++
++A provider whose profile owns an agent runtime may implement
++``slash_commands(*, cwd: str, runtime: NativeAgentRuntime | None) -> list[dict]`` returning
++``{"name", "description", "args_hint"?, "kind"?: "command" | "skill"}`` rows: the commands the native CLI
++itself accepts. Hermes lists them in the slash menu of chats on that provider and sends ``/name args`` to the
++native agent as the turn's prompt; the runtime interprets it. A name Hermes already owns keeps its Hermes
++meaning and the native command is offered as ``/<namespace>:<name>`` (always accepted). ``slash_namespace``
++on the profile names that prefix (default: the provider name). Listing must be quick: it runs per keystroke.
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import Any, Iterable
++
++logger = logging.getLogger(__name__)
++
++# Hermes's registry answers both spellings with its own compression (/compress, alias /compact).
++# Only this pair may claim its bare token on a native-runtime chat — nothing else Hermes owns
++# is unrunnable there (model/status/help have working live-session forms).
++_COMPRESSION_ALIASES = {"compact", "compress"}
++
++
++def _profile(provider: str):
++    if not provider:
++        return None
++    try:
++        from agent.native_runtime import runtime_profile
++        profile = runtime_profile(provider)
++    except Exception:
++        return None
++    return profile if profile is not None and callable(getattr(profile, "slash_commands", None)) else None
++
++
++def _hermes_names(reserved: Iterable[str]) -> set[str]:
++    """Names a Hermes surface already answers besides the command registry: plugin and quick commands."""
++    names = {name.lower().lstrip("/") for name in reserved}
++    try:
++        from hermes_cli.plugins import get_plugin_commands
++        names.update(get_plugin_commands() or {})
++    except Exception:
++        pass
++    try:
++        from hermes_cli.config import load_config_readonly
++        names.update((load_config_readonly() or {}).get("quick_commands") or {})
++    except Exception:
++        pass
++    return names
++
++
++def _hermes_owns(name: str, names: set[str]) -> bool:
++    if name in names:
++        return True
++    try:
++        from hermes_cli.commands import resolve_command
++        return resolve_command(name) is not None
++    except Exception:
++        return False
++
++
++def commands(provider: str, *, cwd: str = "", runtime: Any = None, reserved: Iterable[str] = ()) -> list[dict]:
++    """``[{"slash", "name", "description", "args_hint", "kind"}]`` for a chat on ``provider``; ``[]`` when it
++    has none or listing fails. ``slash`` is the token the user types (``/review`` or ``/claude:compact``)."""
++    profile = _profile(provider)
++    if profile is None:
++        return []
++    try:
++        rows = profile.slash_commands(cwd=cwd, runtime=runtime) or []
++    except Exception:
++        logger.debug("native slash commands for %s failed", provider, exc_info=True)
++        return []
++    namespace = str(getattr(profile, "slash_namespace", "") or profile.name)
++    names = _hermes_names(reserved)
++    out, seen = [], set()
++    for row in rows:
++        name = str((row or {}).get("name") or "").strip().lstrip("/")
++        if not name or name.lower() in seen or any(ch.isspace() for ch in name):
++            continue
++        seen.add(name.lower())
++        slash = f"/{namespace}:{name}" if _hermes_owns(name.lower(), names) else f"/{name}"
++        out.append({"slash": slash, "name": name, "namespace": namespace,
++                    "description": " ".join(str(row.get("description") or "").split()) or f"{profile.display_name} command",
++                    "args_hint": str(row.get("args_hint") or "").strip(),
++                    "kind": "skill" if row.get("kind") == "skill" else "command"})
++    return out
++
++
++def resolve(rows: list[dict], typed: str, arg: str = "") -> dict | None:
++    """The ``command.dispatch`` send directive for ``/typed arg`` among ``rows`` (from :func:`commands`), or None.
++
++    The compression alias pair also claims its bare spelling: a native-runtime chat has no Hermes
++    agent, so Hermes's own ``/compress`` (alias ``/compact``) can never run there — bare ``/compact``
++    must reach the CLI instead of falling through the registry to a dead Hermes compression run.
++    Every other Hermes-owned name keeps its Hermes meaning bare.
++    """
++    typed = typed.strip().lstrip("/").lower()
++    for row in rows:
++        name = row["name"].lower()
++        claims_bare = typed in (row["slash"][1:].lower(), f"{row['namespace']}:{row['name']}".lower()) or (
++            name in _COMPRESSION_ALIASES and typed in _COMPRESSION_ALIASES)
++        if claims_bare:
++            arg = (arg or "").strip()
++            return {"type": "send", "message": f"/{row['name']}" + (f" {arg}" if arg else ""),
++                    "display": f"/{typed}" + (f" {arg}" if arg else "")}
++    return None
++
++
++def completions(rows: list[dict], text: str) -> list[dict]:
++    """``complete.slash`` items (``text`` without the ``/``, like Hermes's own) for the command token ``text``;
++    ``/`` browses all. Name-prefix matches first; ``/<namespace>:`` matches once most of the namespace is typed."""
++    query = text.lstrip("/").lower()
++    prefix, inner = [], []
++    for row in rows:
++        token, bare = row["slash"][1:].lower(), row["name"].lower()
++        typed_namespace = len(query) >= max(2, len(row["namespace"]) - 1) and token.startswith(query)
++        hit = prefix if bare.startswith(query) or typed_namespace else inner if query in bare else None
++        if hit is not None:
++            meta = row["description"] + (f"  {row['args_hint']}" if row["args_hint"] else "")
++            hit.append({"text": row["slash"][1:], "display": row["slash"], "meta": meta[:160], "kind": row["kind"]})
++    return prefix + inner
+diff --git a/agent/native_runtime.py b/agent/native_runtime.py
+new file mode 100644
+index 0000000000..b3da70ccf1
+--- /dev/null
++++ b/agent/native_runtime.py
+@@ -0,0 +1,349 @@
++"""Host boundary for plugin-owned agent loops. Native history is never replayed from the mirror."""
++
++from __future__ import annotations
++
++import json
++import logging
++import threading
++from abc import ABC, abstractmethod
++from collections.abc import Iterator
++from typing import Any
++
++logger = logging.getLogger(__name__)
++STATE_KEY = "native_agent_runtime"
++CONTEXT_KEY = "native_context_usage"
++
++
++class NativeAgentRuntime(ABC):
++    """One session, one caller; events contain display data, never host-executable tool calls."""
++
++    @abstractmethod
++    def run_turn(self, message: Any, *, model: str) -> Iterator[dict[str, Any]]:
++        """Yield session, text_delta, assistant, tool_start, tool_result, request, and result events."""
++
++    @abstractmethod
++    def respond(self, request_id: str, response: dict[str, Any]) -> None:
++        """Resolve a native permission/question request."""
++
++    @abstractmethod
++    def interrupt(self) -> None:
++        """Interrupt the owned turn without replaying it."""
++
++    @abstractmethod
++    def close(self) -> None:
++        """Release the owned process; native persisted history remains resumable."""
++
++    def steer(self, text: str) -> bool:
++        """Deliver user text into the live turn without interrupting it. False when unsupported or idle."""
++        return False
++
++    def context_usage(self) -> dict[str, Any] | None:
++        """The CLI's own context reading (its ``/context``): ``{"context_used", "context_max", "model"?,
++        "categories": [{"id", "label", "tokens"}]}``. None when the runtime cannot tell."""
++        return None
++
++
++def runtime_profile(provider: str):
++    from providers import get_provider_profile
++    profile = get_provider_profile(provider)
++    return profile if profile and profile.agent_runtime else None
++
++
++def owns_agent_loop(agent: Any) -> bool:
++    kind = getattr(agent, "_native_runtime_kind", "")
++    return isinstance(kind, str) and bool(kind)
++
++
++def close_runtime(agent: Any) -> None:
++    runtime = getattr(agent, "_native_runtime", None)
++    agent._native_runtime = None
++    if runtime is not None:
++        runtime.close()
++
++
++def native_context(agent: Any, *, refresh: bool = False) -> dict:
++    """What the context meter shows for a native chat: the CLI's own occupancy plus its compaction count
++    (``compactions`` in the native state, which the runtime reports through a ``session`` event).
++    ``refresh`` asks the live runtime; the last reading is kept in the session row under its own key
++    (never through ``_bind``, which a concurrent turn may be writing) so a restarted backend, or a chat
++    whose CLI is not running, still shows it."""
++    db = getattr(agent, "_session_db", None)
++    snap = None
++    runtime = getattr(agent, "_native_runtime", None)
++    if refresh and runtime is not None and callable(getattr(runtime, "context_usage", None)):
++        try:
++            snap = runtime.context_usage()
++        except Exception:
++            logger.debug("native context usage unavailable", exc_info=True)
++        if isinstance(snap, dict) and snap.get("context_max"):
++            snap = {**snap, "hermes_model": agent.model}
++            agent._native_context = snap
++            if db:
++                db.patch_session_model_config(agent.session_id, {CONTEXT_KEY: snap})
++    if not (isinstance(snap, dict) and snap.get("context_max")):
++        snap = getattr(agent, "_native_context", None)
++        if not isinstance(snap, dict) and db:
++            snap = db.get_session_model_config_value(agent.session_id, CONTEXT_KEY)
++        # A reading taken under another model or context cap (200K/1M) describes the wrong window.
++        if isinstance(snap, dict) and snap.get("hermes_model") not in (None, agent.model):
++            snap = None
++    return {**(snap if isinstance(snap, dict) else {}), "compactions": int(_state(agent).get("compactions") or 0)}
++
++
++def native_usage_fields(agent: Any) -> dict[str, Any]:
++    """``session.usage`` context fields for a native chat (no CLI round trip: the last kept reading)."""
++    ctx = native_context(agent)
++    out: dict[str, Any] = {"compressions": ctx["compactions"]}
++    used, maximum = int(ctx.get("context_used") or 0), int(ctx.get("context_max") or 0)
++    if used and maximum:
++        used = min(used, maximum)
++        out.update(context_used=used, context_max=maximum, context_percent=max(0, min(100, round(used / maximum * 100))),
++                   context_source="provider_usage", context_estimated=False)
++    return out
++
++
++def _state(agent: Any) -> dict:
++    db = getattr(agent, "_session_db", None)
++    value = db.get_session_model_config_value(agent.session_id, STATE_KEY) if db else None
++    return value if isinstance(value, dict) else getattr(agent, "_native_runtime_state", {})
++
++
++def _bind(agent: Any, value: dict) -> None:
++    if not isinstance(value.get("session_id"), str) or not value["session_id"]:
++        raise ValueError("Native runtime did not return a session ID")
++    prior = _state(agent)
++    if prior.get("session_id") and prior["session_id"] != value["session_id"]:
++        raise ValueError("The native runtime changed conversation identity unexpectedly. Start a new chat.")
++    state = {**prior, **value, "provider": agent.provider,
++             "runtime": agent._native_runtime_kind, "owner": agent.session_id, "version": 1}
++    agent._native_runtime_state = state
++    if agent._session_db:
++        agent._ensure_db_session()
++        agent._session_db.patch_session_model_config(agent.session_id, {STATE_KEY: state})
++
++
++def _ensure_runtime(agent: Any, messages: list) -> NativeAgentRuntime:
++    from agent.runtime_cwd import resolve_agent_cwd
++    from hermes_cli.config import load_config_readonly
++    from tools.environments.local import hermes_subprocess_env
++
++    cwd = str(getattr(agent, "session_cwd", None) or resolve_agent_cwd())
++    state = _state(agent)
++    if state.get("owner") and state["owner"] != agent.session_id:
++        raise ValueError("A native session cannot be shared by a fork. Start a new chat.")
++    tail = state.get("mirror_tail_uid")
++    if tail and not any(m.get("message_uid") == tail for m in messages):
++        raise ValueError("The native display history was rewound. Start a new chat; native history was not changed.")
++    if state and (state.get("provider") != agent.provider or state.get("cwd") != cwd):
++        raise ValueError("This conversation belongs to a different native runtime or workspace. Start a new chat.")
++    if not state and any(m.get("role") == "assistant" for m in messages):
++        raise ValueError("Choose the native runtime in a new chat; an existing Hermes transcript cannot be resumed natively.")
++    if getattr(agent, "_native_runtime", None) is None:
++        profile = runtime_profile(agent.provider)
++        if profile.__class__.__module__ == "hermes_cli.plugin_host_profiles":
++            raise RuntimeError("Session-owned agent runtimes require plugins.isolation: in_process.")
++        cfg = load_config_readonly()
++        settings = ((cfg.get("plugins") or {}).get("entries") or {}).get(profile.agent_runtime, {}).get("settings", {})
++        runtime = profile.create_agent_runtime(
++            cwd=cwd, state=state, settings=settings,
++            environment=hermes_subprocess_env(inherit_credentials=True),
++        )
++        if not isinstance(runtime, NativeAgentRuntime):
++            raise TypeError("Provider returned an invalid NativeAgentRuntime")
++        agent._native_runtime = runtime
++    return agent._native_runtime
++
++
++def _notify(agent: Any, name: str, *args, **kwargs) -> None:
++    fn = getattr(agent, name, None)
++    if callable(fn):
++        try:
++            fn(*args, **kwargs)
++        except Exception:
++            logger.debug("Native display callback %s failed", name, exc_info=True)
++
++
++def _request(agent: Any, event: dict) -> dict:
++    if event.get("kind") == "question":
++        callback = getattr(agent, "clarify_callback", None)
++        if callback is None:
++            return {"allowed": False, "message": "No client is available to answer this question."}
++        answer = callback(event.get("questions") or [])
++        answers = answer.get("answers", {}) if isinstance(answer, dict) else {}
++        complete = bool(answers) and all(answers.get(q["qid"]) is not None for q in event.get("questions", []))
++        return {"allowed": complete,
++                "answer": answer, "message": "The question was not answered."}
++    from tools.approval import request_tool_approval
++    from tools.terminal_tool import _get_approval_callback
++
++    subject = json.dumps(event.get("input") or {}, ensure_ascii=False)
++    decision = request_tool_approval(
++        f"{agent._native_runtime_kind}/{event.get('tool', 'tool')}", subject,
++        approval_callback=_get_approval_callback(),
++    )
++    return {"allowed": bool(decision.get("approved")), "message": decision.get("message", "Permission denied.")}
++
++
++def _project_assistant(agent: Any, event: dict, messages: list) -> None:
++    from agent.message_metadata import append_message
++    row = {"role": "assistant", "content": event.get("text") or None}
++    if event.get("tool_calls"):
++        row["tool_calls"] = event["tool_calls"]
++    if event.get("reasoning"):
++        row["reasoning"] = event["reasoning"]
++    append_message(messages, row)
++    if event.get("text"):
++        _notify(agent, "_emit_interim_assistant_message", event["text"])
++
++
++def _project_tool_start(agent: Any, event: dict, messages: list) -> None:
++    _notify(agent, "tool_start_callback", event["id"], event["name"], event.get("input") or {})
++    _notify(agent, "tool_progress_callback", "tool.started", event["name"], "", event.get("input") or {})
++
++
++def _project_tool_result(agent: Any, event: dict, messages: list) -> None:
++    from agent.message_metadata import append_message
++    result = event.get("content", "")
++    append_message(messages, {"role": "tool", "tool_call_id": event["id"], "content": result})
++    _notify(agent, "tool_complete_callback", event["id"], event["name"], event.get("input") or {}, result)
++    _notify(agent, "tool_progress_callback", "tool.completed", event["name"], "", None,
++            is_error=bool(event.get("is_error")), result=result)
++
++
++_PROJECTORS = {
++    "session": lambda agent, event, messages: _bind(agent, event["state"]),
++    "text_delta": lambda agent, event, messages: _notify(agent, "_fire_stream_delta", event.get("text", "")),
++    "reasoning_delta": lambda agent, event, messages: _notify(agent, "_fire_reasoning_delta", event.get("text", "")),
++    "assistant": _project_assistant, "tool_start": _project_tool_start, "tool_result": _project_tool_result,
++    "status": lambda agent, event, messages: _notify(agent, "_emit_diagnostic_status", event.get("text", "")),
++}
++
++
++def _project(agent: Any, event: dict, messages: list) -> None:
++    handler = _PROJECTORS.get(event["type"])
++    if handler is None:
++        raise ValueError(f"Unknown native runtime event: {event['type']}")
++    handler(agent, event, messages)
++
++
++def _usage(agent: Any, result: dict) -> dict:
++    usage = result.get("usage") or {}
++    input_tokens = int(usage.get("input_tokens") or 0)
++    output_tokens = int(usage.get("output_tokens") or 0)
++    cached = int(usage.get("cache_read_input_tokens") or 0)
++    written = int(usage.get("cache_creation_input_tokens") or 0)
++    prompt_tokens = input_tokens + cached + written
++    calls = int(result.get("api_calls") or 1)
++    agent.session_input_tokens += input_tokens
++    agent.session_output_tokens += output_tokens
++    agent.session_cache_read_tokens += cached
++    agent.session_cache_write_tokens += written
++    agent.session_prompt_tokens += prompt_tokens
++    agent.session_completion_tokens += output_tokens
++    agent.session_total_tokens += prompt_tokens + output_tokens
++    agent.session_api_calls += calls
++    agent._last_turn_usage = usage
++    # Native USD totals can include resumed history; no incremental charge is inferred.
++    if agent._session_db:
++        agent._session_db.queue_token_counts(
++            agent.session_id, input_tokens=input_tokens, output_tokens=output_tokens,
++            cache_read_tokens=cached, cache_write_tokens=written, api_call_count=calls,
++            model=agent.model, billing_provider=agent.provider, billing_base_url=agent.base_url,
++            billing_mode="unknown", source="main",
++        )
++    return {"prompt_tokens": prompt_tokens, "completion_tokens": output_tokens,
++            "total_tokens": prompt_tokens + output_tokens, "native_usage": usage}
++
++
++def run_conversation(
++    agent, user_message, system_message=None, conversation_history=None, task_id=None,
++    stream_callback=None, persist_user_message=None, *, persist_user_timestamp=None,
++    persist_user_display_kind=None, persist_user_display_metadata=None,
++    persist_user_platform_id=None, moa_config=None, turn_author=None, title_user_message=None,
++    prelude=None,
++) -> dict:
++    """Called inside the normal Hermes turn lease, before Hermes prompt/tools/compaction."""
++    if prelude is not None:
++        prelude.close()  # Scripted Hermes tool calls cannot run in a native loop that has no Hermes tools.
++    from agent.stream_single_writer import claim_stream_writer
++    from agent.turn_context import _bind_turn_identity, _stage_turn_user_message
++    from agent.message_metadata import append_message
++
++    messages = list(conversation_history or [])
++    _bind_turn_identity(agent, task_id, stream_callback, persist_user_message,
++                        persist_user_timestamp, persist_user_platform_id)
++    user_row, _ = _stage_turn_user_message(agent, user_message, persist_user_message,
++                                          persist_user_timestamp, persist_user_platform_id,
++                                          persist_user_display_kind, persist_user_display_metadata)
++    append_message(messages, user_row)
++    agent._persist_user_message_idx = len(messages) - 1
++    agent._execution_thread_id = threading.get_ident()
++    agent._incremental_persistence_failed = False
++    agent._user_turn_count += 1
++    agent._interrupt_requested = False
++    agent._streamed_assistant_text_parts = []
++    agent._delivered_interim_texts = set()
++    claim_stream_writer(agent)
++    terminal = None
++    usage = {}
++    failure = None
++    runtime = None
++    try:
++        if moa_config:
++            raise ValueError("A native agent runtime cannot run a Hermes mixture-of-agents turn.")
++        runtime = _ensure_runtime(agent, messages[:-1])
++        agent._flush_messages_to_session_db(messages, conversation_history)
++        if agent._incremental_persistence_failed:
++            raise RuntimeError("The user message could not be saved; the native task was not started.")
++        for event in runtime.run_turn(user_message, model=agent.model):
++            agent._touch_activity("native runtime event")
++            if event["type"] == "request":
++                runtime.respond(event["id"], _request(agent, event))
++            elif event["type"] == "result":
++                terminal = event
++                usage = _usage(agent, event)
++            else:
++                _project(agent, event, messages)
++                agent._flush_messages_to_session_db(messages, conversation_history)
++                if agent._incremental_persistence_failed:
++                    raise RuntimeError("Native progress could not be saved; the task was interrupted.")
++        if terminal is None:
++            raise RuntimeError("Native runtime ended without a terminal result. Resume this chat explicitly.")
++    except Exception as exc:
++        logger.exception("Native runtime turn failed")
++        failure = str(exc)
++        if runtime is not None:
++            try:
++                close_runtime(agent)
++            except Exception:
++                logger.exception("Native runtime cleanup failed")
++    finally:
++        agent._execution_thread_id = None
++        agent._session_messages = messages
++    if terminal is not None and failure is None:
++        # The status-bar meter reads the kept reading; refresh it once per turn, not only on panel open.
++        try:
++            native_context(agent, refresh=True)
++        except Exception:
++            logger.debug("native context refresh failed", exc_info=True)
++
++    interrupted = bool(agent._interrupt_requested or (terminal or {}).get("interrupted"))
++    error = failure or (terminal or {}).get("error")
++    text = (terminal or {}).get("text", "")
++    if error:
++        text = text or f"Native runtime failed: {error}"
++        append_message(messages, {"role": "assistant", "content": text})
++    elif not text and interrupted:
++        text = "Task stopped."
++        append_message(messages, {"role": "assistant", "content": text})
++    elif text and not any(m.get("role") == "assistant" and m.get("content") == text
++                          for m in messages[agent._persist_user_message_idx + 1:]):
++        append_message(messages, {"role": "assistant", "content": text})
++    agent._flush_messages_to_session_db(messages, conversation_history)
++    if terminal is not None and messages and messages[-1].get("message_uid"):
++        _bind(agent, {**_state(agent), "mirror_tail_uid": messages[-1]["message_uid"]})
++    from agent.agent_runtime_helpers import note_turn_persisted
++    note_turn_persisted(agent)
++    return {"final_response": text, "messages": messages, "completed": not interrupted and not error,
++            "failed": bool(error), "error": error, "interrupted": interrupted,
++            "api_calls": int((terminal or {}).get("api_calls") or bool(terminal)), "agent_persisted": True, **usage}
 diff --git a/agent/turn_facade.py b/agent/turn_facade.py
 index 3830058dce..66b1307a63 100644
 --- a/agent/turn_facade.py
@@ -237,6 +783,141 @@ index 3830058dce..66b1307a63 100644
          from agent.portal_tags import (
              reset_affinity_scope, reset_conversation_context, set_affinity_scope,
              set_conversation_context,
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 1eac74c94c..d29ae2e9f5 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -541,7 +541,7 @@ import {
+ import { enableRendererAccessibility } from './renderer-accessibility'
+ import { missingRendererAssets, presentRendererIndexes } from './renderer-bundle'
+ import { planLaunchSwitches, readDesktopLaunchConfig } from './renderer-heap-flags'
+-import { loadRendererLoadErrorPage } from './renderer-load-error-page'
++import { loadRendererLoadErrorPage, RENDERER_RELOAD_SENTINEL_URL } from './renderer-load-error-page'
+ import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
+ import { fetchRosterSourceData } from './roster-source-fetch'
+ import { rosterSourceStatus } from './roster-source-status'
+@@ -2233,6 +2233,14 @@ const mainProcessLagWatchdog = createMainProcessLagWatchdog({
+ 
+ installCrashForensics({ flush: flushDesktopLogBufferSync, log: rememberLog })
+ 
++// Launched from a terminal that later closed, the inherited stdio is revoked and
++// every console.* write fails async with EIO/EPIPE as an uncaught exception
++// (it aborted reconcileUnifiedDesktopHalves on each reload). desktop.log is the
++// real sink, so a dead stdio stream is dropped silently.
++for (const stream of [process.stdout, process.stderr]) {
++  stream?.on?.('error', () => {})
++}
++
+ // A rejected loadURL leaves a blank window and, unhandled, no trace anywhere
+ // the user can send us. `label` names the surface so the log says which one.
+ function loadWindowUrl(win, url, label) {
+@@ -12332,6 +12340,14 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
+       return
+     }
+ 
++    // Recovery page's Reload button (see RENDERER_RELOAD_SENTINEL_URL).
++    if (url.startsWith(RENDERER_RELOAD_SENTINEL_URL)) {
++      event.preventDefault()
++      void win.loadURL(DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString()).catch(() => {})
++
++      return
++    }
++
+     event.preventDefault()
+     void openExternalUrl(url)
+   })
+diff --git a/apps/desktop/electron/renderer-load-error-page.test.ts b/apps/desktop/electron/renderer-load-error-page.test.ts
+index e2b6011345..59b75484fc 100644
+--- a/apps/desktop/electron/renderer-load-error-page.test.ts
++++ b/apps/desktop/electron/renderer-load-error-page.test.ts
+@@ -26,9 +26,9 @@ test('error page reload button targets the real renderer URL when provided', ()
+     reloadUrl: 'file:///C:/Hermes%20Agent/dist/index.html'
+   })
+ 
+-  // A data: page cannot recover with location.reload() (it would re-render
+-  // the error page) — the button must navigate back to the app URL.
+-  assert.match(html, /location\.replace\("file:\/\/\/C:\/Hermes%20Agent\/dist\/index\.html"\)/)
++  // A data: page cannot recover with location.reload() (it would re-render the error page),
++  // and Chromium blocks data: → file:, so a file: target goes through main's reload sentinel.
++  assert.match(html, /location\.replace\("https:\/\/hermes-desktop-reload\.invalid\/"\)/)
+   assert.doesNotMatch(html, /location\.reload\(\)/)
+ })
+ 
+@@ -49,7 +49,7 @@ test('reloadUrl cannot break out of the inline script block', () => {
+   // element and inject markup/script into the error page.
+   const html = buildRendererLoadErrorPage({
+     errorDescription: 'load failed',
+-    reloadUrl: 'file:///C:/x/index.html</script><script>alert("pwned")</script>'
++    reloadUrl: 'http://localhost:5173/</script><script>alert("pwned")</script>'
+   })
+ 
+   assert.doesNotMatch(html, /<\/script><script>/)
+diff --git a/apps/desktop/electron/renderer-load-error-page.ts b/apps/desktop/electron/renderer-load-error-page.ts
+index d701ab5878..3a676ed9b2 100644
+--- a/apps/desktop/electron/renderer-load-error-page.ts
++++ b/apps/desktop/electron/renderer-load-error-page.ts
+@@ -60,10 +60,16 @@ function escapeInlineScriptJson(value: string): string {
+     .replace(/\u2029/g, '\\u2029')
+ }
+ 
++/**
++ * Chromium refuses a data: page navigating to file:// ("Not allowed to load local resource"),
++ * so a file: reloadUrl goes through this sentinel instead: main's will-navigate handler cancels
++ * it and loads the renderer itself.
++ */
++export const RENDERER_RELOAD_SENTINEL_URL = 'https://hermes-desktop-reload.invalid/'
++
+ function reloadButtonJs(details: RendererLoadErrorDetails): string {
+-  const target = details.reloadUrl
+-    ? `location.replace(${escapeInlineScriptJson(JSON.stringify(details.reloadUrl))})`
+-    : 'location.reload()'
++  const href = details.reloadUrl?.startsWith('file:') ? RENDERER_RELOAD_SENTINEL_URL : details.reloadUrl
++  const target = href ? `location.replace(${escapeInlineScriptJson(JSON.stringify(href))})` : 'location.reload()'
+ 
+   return (
+     '<button id="reload" type="button">Reload</button>\n' +
+diff --git a/apps/desktop/electron/window-renderer-lifecycle.test.ts b/apps/desktop/electron/window-renderer-lifecycle.test.ts
+index 599a3a396b..ed1d5b0a65 100644
+--- a/apps/desktop/electron/window-renderer-lifecycle.test.ts
++++ b/apps/desktop/electron/window-renderer-lifecycle.test.ts
+@@ -103,6 +103,10 @@ test('shouldReloadAfterRendererGone never reloads expected teardown or unknown r
+     reload: false,
+     suppressedReason: 'expected-teardown'
+   })
++  // A live window's renderer exiting 0 is not a normal shutdown — reload it.
++  assert.deepEqual(shouldReloadAfterRendererGone({ reason: 'clean-exit', isDestroyed: false, recentReloadTimes: [] }), {
++    reload: true
++  })
+   assert.deepEqual(
+     shouldReloadAfterRendererGone({ reason: 'launch-failed', isDestroyed: false, recentReloadTimes: [] }),
+     {
+diff --git a/apps/desktop/electron/window-renderer-lifecycle.ts b/apps/desktop/electron/window-renderer-lifecycle.ts
+index 091d137c1b..75f6defb36 100644
+--- a/apps/desktop/electron/window-renderer-lifecycle.ts
++++ b/apps/desktop/electron/window-renderer-lifecycle.ts
+@@ -17,8 +17,8 @@
+ //   `isIntentionalTeardown` (expected teardown). Once the budget is spent, a
+ //   live window hands off to `onRendererTerminated` so it ends on a visible
+ //   recovery affordance rather than a dead window.
+-// - `render-process-gone` with other reasons (`launch-failed`, `clean-exit`,
+-//   unknown) → log only.
++// - `render-process-gone` with `clean-exit` on a live window → same bounded reload.
++// - `render-process-gone` with other reasons (`launch-failed`, unknown) → log only.
+ // - `unresponsive` → log only (no reload; Chromium usually follows with
+ //   render-process-gone, and forcing a reload while the main thread is wedged
+ //   can make things worse).
+@@ -133,7 +133,10 @@ export interface LifecycleWindowLike {
+ const DEFAULT_RELOAD_WINDOW_MS = 60_000
+ const DEFAULT_RELOAD_MAX = 3
+ 
+-const RECOVERABLE_REASONS = new Set(['crashed', 'oom', 'killed'])
++// `clean-exit` on a LIVE window is not a normal shutdown (teardown short-circuits first via
++// isDestroyed/isIntentionalTeardown): macOS can end a renderer with exit 0 under app-nap/memory
++// pressure, which used to strand the user on the recovery page. Reload it under the same budget.
++const RECOVERABLE_REASONS = new Set(['crashed', 'oom', 'killed', 'clean-exit'])
+ 
+ function safeNow(now: (() => number) | undefined): number {
+   return typeof now === 'function' ? now() : Date.now()
 diff --git a/apps/desktop/src/components/assistant-ui/thread/status.tsx b/apps/desktop/src/components/assistant-ui/thread/status.tsx
 index d9ebf1575f..70ab7833ce 100644
 --- a/apps/desktop/src/components/assistant-ui/thread/status.tsx
@@ -618,542 +1299,6 @@ index 4d96df74c3..a3ce480e6c 100644
      }
  
  
-diff --git a/agent/agent_init_snapshot.py b/agent/agent_init_snapshot.py
-new file mode 100644
-index 0000000000..f398a20a5b
---- /dev/null
-+++ b/agent/agent_init_snapshot.py
-@@ -0,0 +1,32 @@
-+"""Initial primary-route restoration snapshot."""
-+
-+def snapshot_primary_runtime(agent):
-+    # Per-turn restoration snapshot: after a fallback, the next turn restores these so the
-+    # preferred model gets a fresh attempt.
-+    _cc = agent.context_compressor
-+    agent._primary_runtime = {
-+        "model": agent.model,
-+        "provider": agent.provider,
-+        "requested_provider": agent.requested_provider,
-+        "base_url": agent.base_url,
-+        "api_mode": agent.api_mode,
-+        "api_key": getattr(agent, "api_key", ""),
-+        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
-+        "client_kwargs": dict(agent._client_kwargs),
-+        "use_prompt_caching": agent._use_prompt_caching,
-+        "use_native_cache_layout": agent._use_native_cache_layout,
-+        "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
-+        # Engine state _try_activate_fallback() overwrites (getattr: plugin engines may lack them).
-+        "compressor_model": getattr(_cc, "model", agent.model),
-+        "compressor_base_url": getattr(_cc, "base_url", agent.base_url),
-+        "compressor_api_key": getattr(_cc, "api_key", ""),
-+        "compressor_provider": getattr(_cc, "provider", agent.provider),
-+        "compressor_context_length": _cc.context_length,
-+        "compressor_threshold_tokens": _cc.threshold_tokens,
-+    }
-+    if agent.api_mode == "anthropic_messages":
-+        agent._primary_runtime.update({
-+            "anthropic_api_key": agent._anthropic_api_key,
-+            "anthropic_base_url": agent._anthropic_base_url,
-+            "is_anthropic_oauth": agent._is_anthropic_oauth,
-+        })
-diff --git a/agent/agent_runtime_helpers_billing.py b/agent/agent_runtime_helpers_billing.py
-new file mode 100644
-index 0000000000..b05b650f93
---- /dev/null
-+++ b/agent/agent_runtime_helpers_billing.py
-@@ -0,0 +1,20 @@
-+"""Durable billing route after a deliberate model switch."""
-+
-+import logging
-+
-+logger = logging.getLogger(__name__)
-+
-+def persist_switch_billing_route(agent) -> None:
-+    """Persist the billing route so dashboard Model cards show the post-switch provider."""
-+    # _session_db / session_id may be unset (tests, bare agents).
-+    session_db = getattr(agent, "_session_db", None)
-+    session_id = getattr(agent, "session_id", None)
-+    if session_db is None or not session_id:
-+        return
-+    try:
-+        session_db.update_session_billing_route(
-+            session_id, provider=agent.provider, base_url=agent.base_url,
-+            billing_mode=getattr(agent, "api_mode", None),
-+        )
-+    except Exception:
-+        logger.warning("Failed to persist billing route after model switch", exc_info=True)
-diff --git a/agent/native_commands.py b/agent/native_commands.py
-new file mode 100644
-index 0000000000..514b91a2ae
---- /dev/null
-+++ b/agent/native_commands.py
-@@ -0,0 +1,121 @@
-+"""Slash commands a native agent runtime brings with it (Claude Code's ``/review``, a Muse skill, an ACP ``/plan``).
-+
-+A provider whose profile owns an agent runtime may implement
-+``slash_commands(*, cwd: str, runtime: NativeAgentRuntime | None) -> list[dict]`` returning
-+``{"name", "description", "args_hint"?, "kind"?: "command" | "skill"}`` rows: the commands the native CLI
-+itself accepts. Hermes lists them in the slash menu of chats on that provider and sends ``/name args`` to the
-+native agent as the turn's prompt; the runtime interprets it. A name Hermes already owns keeps its Hermes
-+meaning and the native command is offered as ``/<namespace>:<name>`` (always accepted). ``slash_namespace``
-+on the profile names that prefix (default: the provider name). Listing must be quick: it runs per keystroke.
-+"""
-+
-+from __future__ import annotations
-+
-+import logging
-+from typing import Any, Iterable
-+
-+logger = logging.getLogger(__name__)
-+
-+# Hermes's registry answers both spellings with its own compression (/compress, alias /compact).
-+# Only this pair may claim its bare token on a native-runtime chat — nothing else Hermes owns
-+# is unrunnable there (model/status/help have working live-session forms).
-+_COMPRESSION_ALIASES = {"compact", "compress"}
-+
-+
-+def _profile(provider: str):
-+    if not provider:
-+        return None
-+    try:
-+        from agent.native_runtime import runtime_profile
-+        profile = runtime_profile(provider)
-+    except Exception:
-+        return None
-+    return profile if profile is not None and callable(getattr(profile, "slash_commands", None)) else None
-+
-+
-+def _hermes_names(reserved: Iterable[str]) -> set[str]:
-+    """Names a Hermes surface already answers besides the command registry: plugin and quick commands."""
-+    names = {name.lower().lstrip("/") for name in reserved}
-+    try:
-+        from hermes_cli.plugins import get_plugin_commands
-+        names.update(get_plugin_commands() or {})
-+    except Exception:
-+        pass
-+    try:
-+        from hermes_cli.config import load_config_readonly
-+        names.update((load_config_readonly() or {}).get("quick_commands") or {})
-+    except Exception:
-+        pass
-+    return names
-+
-+
-+def _hermes_owns(name: str, names: set[str]) -> bool:
-+    if name in names:
-+        return True
-+    try:
-+        from hermes_cli.commands import resolve_command
-+        return resolve_command(name) is not None
-+    except Exception:
-+        return False
-+
-+
-+def commands(provider: str, *, cwd: str = "", runtime: Any = None, reserved: Iterable[str] = ()) -> list[dict]:
-+    """``[{"slash", "name", "description", "args_hint", "kind"}]`` for a chat on ``provider``; ``[]`` when it
-+    has none or listing fails. ``slash`` is the token the user types (``/review`` or ``/claude:compact``)."""
-+    profile = _profile(provider)
-+    if profile is None:
-+        return []
-+    try:
-+        rows = profile.slash_commands(cwd=cwd, runtime=runtime) or []
-+    except Exception:
-+        logger.debug("native slash commands for %s failed", provider, exc_info=True)
-+        return []
-+    namespace = str(getattr(profile, "slash_namespace", "") or profile.name)
-+    names = _hermes_names(reserved)
-+    out, seen = [], set()
-+    for row in rows:
-+        name = str((row or {}).get("name") or "").strip().lstrip("/")
-+        if not name or name.lower() in seen or any(ch.isspace() for ch in name):
-+            continue
-+        seen.add(name.lower())
-+        slash = f"/{namespace}:{name}" if _hermes_owns(name.lower(), names) else f"/{name}"
-+        out.append({"slash": slash, "name": name, "namespace": namespace,
-+                    "description": " ".join(str(row.get("description") or "").split()) or f"{profile.display_name} command",
-+                    "args_hint": str(row.get("args_hint") or "").strip(),
-+                    "kind": "skill" if row.get("kind") == "skill" else "command"})
-+    return out
-+
-+
-+def resolve(rows: list[dict], typed: str, arg: str = "") -> dict | None:
-+    """The ``command.dispatch`` send directive for ``/typed arg`` among ``rows`` (from :func:`commands`), or None.
-+
-+    The compression alias pair also claims its bare spelling: a native-runtime chat has no Hermes
-+    agent, so Hermes's own ``/compress`` (alias ``/compact``) can never run there — bare ``/compact``
-+    must reach the CLI instead of falling through the registry to a dead Hermes compression run.
-+    Every other Hermes-owned name keeps its Hermes meaning bare.
-+    """
-+    typed = typed.strip().lstrip("/").lower()
-+    for row in rows:
-+        name = row["name"].lower()
-+        claims_bare = typed in (row["slash"][1:].lower(), f"{row['namespace']}:{row['name']}".lower()) or (
-+            name in _COMPRESSION_ALIASES and typed in _COMPRESSION_ALIASES)
-+        if claims_bare:
-+            arg = (arg or "").strip()
-+            return {"type": "send", "message": f"/{row['name']}" + (f" {arg}" if arg else ""),
-+                    "display": f"/{typed}" + (f" {arg}" if arg else "")}
-+    return None
-+
-+
-+def completions(rows: list[dict], text: str) -> list[dict]:
-+    """``complete.slash`` items (``text`` without the ``/``, like Hermes's own) for the command token ``text``;
-+    ``/`` browses all. Name-prefix matches first; ``/<namespace>:`` matches once most of the namespace is typed."""
-+    query = text.lstrip("/").lower()
-+    prefix, inner = [], []
-+    for row in rows:
-+        token, bare = row["slash"][1:].lower(), row["name"].lower()
-+        typed_namespace = len(query) >= max(2, len(row["namespace"]) - 1) and token.startswith(query)
-+        hit = prefix if bare.startswith(query) or typed_namespace else inner if query in bare else None
-+        if hit is not None:
-+            meta = row["description"] + (f"  {row['args_hint']}" if row["args_hint"] else "")
-+            hit.append({"text": row["slash"][1:], "display": row["slash"], "meta": meta[:160], "kind": row["kind"]})
-+    return prefix + inner
-diff --git a/agent/native_runtime.py b/agent/native_runtime.py
-new file mode 100644
-index 0000000000..d5b042b3ab
---- /dev/null
-+++ b/agent/native_runtime.py
-@@ -0,0 +1,339 @@
-+"""Host boundary for plugin-owned agent loops. Native history is never replayed from the mirror."""
-+
-+from __future__ import annotations
-+
-+import json
-+import logging
-+import threading
-+from abc import ABC, abstractmethod
-+from collections.abc import Iterator
-+from typing import Any
-+
-+logger = logging.getLogger(__name__)
-+STATE_KEY = "native_agent_runtime"
-+CONTEXT_KEY = "native_context_usage"
-+
-+
-+class NativeAgentRuntime(ABC):
-+    """One session, one caller; events contain display data, never host-executable tool calls."""
-+
-+    @abstractmethod
-+    def run_turn(self, message: Any, *, model: str) -> Iterator[dict[str, Any]]:
-+        """Yield session, text_delta, assistant, tool_start, tool_result, request, and result events."""
-+
-+    @abstractmethod
-+    def respond(self, request_id: str, response: dict[str, Any]) -> None:
-+        """Resolve a native permission/question request."""
-+
-+    @abstractmethod
-+    def interrupt(self) -> None:
-+        """Interrupt the owned turn without replaying it."""
-+
-+    @abstractmethod
-+    def close(self) -> None:
-+        """Release the owned process; native persisted history remains resumable."""
-+
-+    def steer(self, text: str) -> bool:
-+        """Deliver user text into the live turn without interrupting it. False when unsupported or idle."""
-+        return False
-+
-+    def context_usage(self) -> dict[str, Any] | None:
-+        """The CLI's own context reading (its ``/context``): ``{"context_used", "context_max", "model"?,
-+        "categories": [{"id", "label", "tokens"}]}``. None when the runtime cannot tell."""
-+        return None
-+
-+
-+def runtime_profile(provider: str):
-+    from providers import get_provider_profile
-+    profile = get_provider_profile(provider)
-+    return profile if profile and profile.agent_runtime else None
-+
-+
-+def owns_agent_loop(agent: Any) -> bool:
-+    kind = getattr(agent, "_native_runtime_kind", "")
-+    return isinstance(kind, str) and bool(kind)
-+
-+
-+def close_runtime(agent: Any) -> None:
-+    runtime = getattr(agent, "_native_runtime", None)
-+    agent._native_runtime = None
-+    if runtime is not None:
-+        runtime.close()
-+
-+
-+def native_context(agent: Any, *, refresh: bool = False) -> dict:
-+    """What the context meter shows for a native chat: the CLI's own occupancy plus its compaction count
-+    (``compactions`` in the native state, which the runtime reports through a ``session`` event).
-+    ``refresh`` asks the live runtime; the last reading is kept in the session row under its own key
-+    (never through ``_bind``, which a concurrent turn may be writing) so a restarted backend, or a chat
-+    whose CLI is not running, still shows it."""
-+    db = getattr(agent, "_session_db", None)
-+    snap = None
-+    runtime = getattr(agent, "_native_runtime", None)
-+    if refresh and runtime is not None and callable(getattr(runtime, "context_usage", None)):
-+        try:
-+            snap = runtime.context_usage()
-+        except Exception:
-+            logger.debug("native context usage unavailable", exc_info=True)
-+        if isinstance(snap, dict) and snap.get("context_max"):
-+            agent._native_context = snap
-+            if db:
-+                db.patch_session_model_config(agent.session_id, {CONTEXT_KEY: snap})
-+    if not (isinstance(snap, dict) and snap.get("context_max")):
-+        snap = getattr(agent, "_native_context", None)
-+        if not isinstance(snap, dict) and db:
-+            snap = db.get_session_model_config_value(agent.session_id, CONTEXT_KEY)
-+    return {**(snap if isinstance(snap, dict) else {}), "compactions": int(_state(agent).get("compactions") or 0)}
-+
-+
-+def native_usage_fields(agent: Any) -> dict[str, Any]:
-+    """``session.usage`` context fields for a native chat (no CLI round trip: the last kept reading)."""
-+    ctx = native_context(agent)
-+    out: dict[str, Any] = {"compressions": ctx["compactions"]}
-+    used, maximum = int(ctx.get("context_used") or 0), int(ctx.get("context_max") or 0)
-+    if used and maximum:
-+        used = min(used, maximum)
-+        out.update(context_used=used, context_max=maximum, context_percent=max(0, min(100, round(used / maximum * 100))),
-+                   context_source="provider_usage", context_estimated=False)
-+    return out
-+
-+
-+def _state(agent: Any) -> dict:
-+    db = getattr(agent, "_session_db", None)
-+    value = db.get_session_model_config_value(agent.session_id, STATE_KEY) if db else None
-+    return value if isinstance(value, dict) else getattr(agent, "_native_runtime_state", {})
-+
-+
-+def _bind(agent: Any, value: dict) -> None:
-+    if not isinstance(value.get("session_id"), str) or not value["session_id"]:
-+        raise ValueError("Native runtime did not return a session ID")
-+    prior = _state(agent)
-+    if prior.get("session_id") and prior["session_id"] != value["session_id"]:
-+        raise ValueError("The native runtime changed conversation identity unexpectedly. Start a new chat.")
-+    state = {**prior, **value, "provider": agent.provider,
-+             "runtime": agent._native_runtime_kind, "owner": agent.session_id, "version": 1}
-+    agent._native_runtime_state = state
-+    if agent._session_db:
-+        agent._ensure_db_session()
-+        agent._session_db.patch_session_model_config(agent.session_id, {STATE_KEY: state})
-+
-+
-+def _ensure_runtime(agent: Any, messages: list) -> NativeAgentRuntime:
-+    from agent.runtime_cwd import resolve_agent_cwd
-+    from hermes_cli.config import load_config_readonly
-+    from tools.environments.local import hermes_subprocess_env
-+
-+    cwd = str(getattr(agent, "session_cwd", None) or resolve_agent_cwd())
-+    state = _state(agent)
-+    if state.get("owner") and state["owner"] != agent.session_id:
-+        raise ValueError("A native session cannot be shared by a fork. Start a new chat.")
-+    tail = state.get("mirror_tail_uid")
-+    if tail and not any(m.get("message_uid") == tail for m in messages):
-+        raise ValueError("The native display history was rewound. Start a new chat; native history was not changed.")
-+    if state and (state.get("provider") != agent.provider or state.get("cwd") != cwd):
-+        raise ValueError("This conversation belongs to a different native runtime or workspace. Start a new chat.")
-+    if not state and any(m.get("role") == "assistant" for m in messages):
-+        raise ValueError("Choose the native runtime in a new chat; an existing Hermes transcript cannot be resumed natively.")
-+    if getattr(agent, "_native_runtime", None) is None:
-+        profile = runtime_profile(agent.provider)
-+        if profile.__class__.__module__ == "hermes_cli.plugin_host_profiles":
-+            raise RuntimeError("Session-owned agent runtimes require plugins.isolation: in_process.")
-+        cfg = load_config_readonly()
-+        settings = ((cfg.get("plugins") or {}).get("entries") or {}).get(profile.agent_runtime, {}).get("settings", {})
-+        runtime = profile.create_agent_runtime(
-+            cwd=cwd, state=state, settings=settings,
-+            environment=hermes_subprocess_env(inherit_credentials=True),
-+        )
-+        if not isinstance(runtime, NativeAgentRuntime):
-+            raise TypeError("Provider returned an invalid NativeAgentRuntime")
-+        agent._native_runtime = runtime
-+    return agent._native_runtime
-+
-+
-+def _notify(agent: Any, name: str, *args, **kwargs) -> None:
-+    fn = getattr(agent, name, None)
-+    if callable(fn):
-+        try:
-+            fn(*args, **kwargs)
-+        except Exception:
-+            logger.debug("Native display callback %s failed", name, exc_info=True)
-+
-+
-+def _request(agent: Any, event: dict) -> dict:
-+    if event.get("kind") == "question":
-+        callback = getattr(agent, "clarify_callback", None)
-+        if callback is None:
-+            return {"allowed": False, "message": "No client is available to answer this question."}
-+        answer = callback(event.get("questions") or [])
-+        answers = answer.get("answers", {}) if isinstance(answer, dict) else {}
-+        complete = bool(answers) and all(answers.get(q["qid"]) is not None for q in event.get("questions", []))
-+        return {"allowed": complete,
-+                "answer": answer, "message": "The question was not answered."}
-+    from tools.approval import request_tool_approval
-+    from tools.terminal_tool import _get_approval_callback
-+
-+    subject = json.dumps(event.get("input") or {}, ensure_ascii=False)
-+    decision = request_tool_approval(
-+        f"{agent._native_runtime_kind}/{event.get('tool', 'tool')}", subject,
-+        approval_callback=_get_approval_callback(),
-+    )
-+    return {"allowed": bool(decision.get("approved")), "message": decision.get("message", "Permission denied.")}
-+
-+
-+def _project_assistant(agent: Any, event: dict, messages: list) -> None:
-+    from agent.message_metadata import append_message
-+    row = {"role": "assistant", "content": event.get("text") or None}
-+    if event.get("tool_calls"):
-+        row["tool_calls"] = event["tool_calls"]
-+    if event.get("reasoning"):
-+        row["reasoning"] = event["reasoning"]
-+    append_message(messages, row)
-+    if event.get("text"):
-+        _notify(agent, "_emit_interim_assistant_message", event["text"])
-+
-+
-+def _project_tool_start(agent: Any, event: dict, messages: list) -> None:
-+    _notify(agent, "tool_start_callback", event["id"], event["name"], event.get("input") or {})
-+    _notify(agent, "tool_progress_callback", "tool.started", event["name"], "", event.get("input") or {})
-+
-+
-+def _project_tool_result(agent: Any, event: dict, messages: list) -> None:
-+    from agent.message_metadata import append_message
-+    result = event.get("content", "")
-+    append_message(messages, {"role": "tool", "tool_call_id": event["id"], "content": result})
-+    _notify(agent, "tool_complete_callback", event["id"], event["name"], event.get("input") or {}, result)
-+    _notify(agent, "tool_progress_callback", "tool.completed", event["name"], "", None,
-+            is_error=bool(event.get("is_error")), result=result)
-+
-+
-+_PROJECTORS = {
-+    "session": lambda agent, event, messages: _bind(agent, event["state"]),
-+    "text_delta": lambda agent, event, messages: _notify(agent, "_fire_stream_delta", event.get("text", "")),
-+    "reasoning_delta": lambda agent, event, messages: _notify(agent, "_fire_reasoning_delta", event.get("text", "")),
-+    "assistant": _project_assistant, "tool_start": _project_tool_start, "tool_result": _project_tool_result,
-+    "status": lambda agent, event, messages: _notify(agent, "_emit_diagnostic_status", event.get("text", "")),
-+}
-+
-+
-+def _project(agent: Any, event: dict, messages: list) -> None:
-+    handler = _PROJECTORS.get(event["type"])
-+    if handler is None:
-+        raise ValueError(f"Unknown native runtime event: {event['type']}")
-+    handler(agent, event, messages)
-+
-+
-+def _usage(agent: Any, result: dict) -> dict:
-+    usage = result.get("usage") or {}
-+    input_tokens = int(usage.get("input_tokens") or 0)
-+    output_tokens = int(usage.get("output_tokens") or 0)
-+    cached = int(usage.get("cache_read_input_tokens") or 0)
-+    written = int(usage.get("cache_creation_input_tokens") or 0)
-+    prompt_tokens = input_tokens + cached + written
-+    calls = int(result.get("api_calls") or 1)
-+    agent.session_input_tokens += input_tokens
-+    agent.session_output_tokens += output_tokens
-+    agent.session_cache_read_tokens += cached
-+    agent.session_cache_write_tokens += written
-+    agent.session_prompt_tokens += prompt_tokens
-+    agent.session_completion_tokens += output_tokens
-+    agent.session_total_tokens += prompt_tokens + output_tokens
-+    agent.session_api_calls += calls
-+    agent._last_turn_usage = usage
-+    # Native USD totals can include resumed history; no incremental charge is inferred.
-+    if agent._session_db:
-+        agent._session_db.queue_token_counts(
-+            agent.session_id, input_tokens=input_tokens, output_tokens=output_tokens,
-+            cache_read_tokens=cached, cache_write_tokens=written, api_call_count=calls,
-+            model=agent.model, billing_provider=agent.provider, billing_base_url=agent.base_url,
-+            billing_mode="unknown", source="main",
-+        )
-+    return {"prompt_tokens": prompt_tokens, "completion_tokens": output_tokens,
-+            "total_tokens": prompt_tokens + output_tokens, "native_usage": usage}
-+
-+
-+def run_conversation(
-+    agent, user_message, system_message=None, conversation_history=None, task_id=None,
-+    stream_callback=None, persist_user_message=None, *, persist_user_timestamp=None,
-+    persist_user_display_kind=None, persist_user_display_metadata=None,
-+    persist_user_platform_id=None, moa_config=None, turn_author=None, title_user_message=None,
-+    prelude=None,
-+) -> dict:
-+    """Called inside the normal Hermes turn lease, before Hermes prompt/tools/compaction."""
-+    if prelude is not None:
-+        prelude.close()  # Scripted Hermes tool calls cannot run in a native loop that has no Hermes tools.
-+    from agent.stream_single_writer import claim_stream_writer
-+    from agent.turn_context import _bind_turn_identity, _stage_turn_user_message
-+    from agent.message_metadata import append_message
-+
-+    messages = list(conversation_history or [])
-+    _bind_turn_identity(agent, task_id, stream_callback, persist_user_message,
-+                        persist_user_timestamp, persist_user_platform_id)
-+    user_row, _ = _stage_turn_user_message(agent, user_message, persist_user_message,
-+                                          persist_user_timestamp, persist_user_platform_id,
-+                                          persist_user_display_kind, persist_user_display_metadata)
-+    append_message(messages, user_row)
-+    agent._persist_user_message_idx = len(messages) - 1
-+    agent._execution_thread_id = threading.get_ident()
-+    agent._incremental_persistence_failed = False
-+    agent._user_turn_count += 1
-+    agent._interrupt_requested = False
-+    agent._streamed_assistant_text_parts = []
-+    agent._delivered_interim_texts = set()
-+    claim_stream_writer(agent)
-+    terminal = None
-+    usage = {}
-+    failure = None
-+    runtime = None
-+    try:
-+        if moa_config:
-+            raise ValueError("A native agent runtime cannot run a Hermes mixture-of-agents turn.")
-+        runtime = _ensure_runtime(agent, messages[:-1])
-+        agent._flush_messages_to_session_db(messages, conversation_history)
-+        if agent._incremental_persistence_failed:
-+            raise RuntimeError("The user message could not be saved; the native task was not started.")
-+        for event in runtime.run_turn(user_message, model=agent.model):
-+            agent._touch_activity("native runtime event")
-+            if event["type"] == "request":
-+                runtime.respond(event["id"], _request(agent, event))
-+            elif event["type"] == "result":
-+                terminal = event
-+                usage = _usage(agent, event)
-+            else:
-+                _project(agent, event, messages)
-+                agent._flush_messages_to_session_db(messages, conversation_history)
-+                if agent._incremental_persistence_failed:
-+                    raise RuntimeError("Native progress could not be saved; the task was interrupted.")
-+        if terminal is None:
-+            raise RuntimeError("Native runtime ended without a terminal result. Resume this chat explicitly.")
-+    except Exception as exc:
-+        logger.exception("Native runtime turn failed")
-+        failure = str(exc)
-+        if runtime is not None:
-+            try:
-+                close_runtime(agent)
-+            except Exception:
-+                logger.exception("Native runtime cleanup failed")
-+    finally:
-+        agent._execution_thread_id = None
-+        agent._session_messages = messages
-+
-+    interrupted = bool(agent._interrupt_requested or (terminal or {}).get("interrupted"))
-+    error = failure or (terminal or {}).get("error")
-+    text = (terminal or {}).get("text", "")
-+    if error:
-+        text = text or f"Native runtime failed: {error}"
-+        append_message(messages, {"role": "assistant", "content": text})
-+    elif not text and interrupted:
-+        text = "Task stopped."
-+        append_message(messages, {"role": "assistant", "content": text})
-+    elif text and not any(m.get("role") == "assistant" and m.get("content") == text
-+                          for m in messages[agent._persist_user_message_idx + 1:]):
-+        append_message(messages, {"role": "assistant", "content": text})
-+    agent._flush_messages_to_session_db(messages, conversation_history)
-+    if terminal is not None and messages and messages[-1].get("message_uid"):
-+        _bind(agent, {**_state(agent), "mirror_tail_uid": messages[-1]["message_uid"]})
-+    from agent.agent_runtime_helpers import note_turn_persisted
-+    note_turn_persisted(agent)
-+    return {"final_response": text, "messages": messages, "completed": not interrupted and not error,
-+            "failed": bool(error), "error": error, "interrupted": interrupted,
-+            "api_calls": int((terminal or {}).get("api_calls") or bool(terminal)), "agent_persisted": True, **usage}
 diff --git a/website/docs/developer-guide/plugins/agent-runtime-plugin.md b/website/docs/developer-guide/plugins/agent-runtime-plugin.md
 new file mode 100644
 index 0000000000..e984c5a8cb
@@ -1228,123 +1373,3 @@ index 0000000000..e984c5a8cb
 +name Hermes already owns keeps its Hermes meaning, and the native command is offered
 +as `/<slash_namespace>:<name>` (the profile attribute; default: the provider name).
 +The listing runs per keystroke, so it must answer from a cache.
-diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
-index 1eac74c94c..cb5b92d722 100644
---- a/apps/desktop/electron/main.ts
-+++ b/apps/desktop/electron/main.ts
-@@ -541,7 +541,7 @@ import {
- import { enableRendererAccessibility } from './renderer-accessibility'
- import { missingRendererAssets, presentRendererIndexes } from './renderer-bundle'
- import { planLaunchSwitches, readDesktopLaunchConfig } from './renderer-heap-flags'
--import { loadRendererLoadErrorPage } from './renderer-load-error-page'
-+import { loadRendererLoadErrorPage, RENDERER_RELOAD_SENTINEL_URL } from './renderer-load-error-page'
- import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
- import { fetchRosterSourceData } from './roster-source-fetch'
- import { rosterSourceStatus } from './roster-source-status'
-@@ -12332,6 +12332,14 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
-       return
-     }
- 
-+    // Recovery page's Reload button (see RENDERER_RELOAD_SENTINEL_URL).
-+    if (url.startsWith(RENDERER_RELOAD_SENTINEL_URL)) {
-+      event.preventDefault()
-+      void win.loadURL(DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString()).catch(() => {})
-+
-+      return
-+    }
-+
-     event.preventDefault()
-     void openExternalUrl(url)
-   })
-diff --git a/apps/desktop/electron/renderer-load-error-page.test.ts b/apps/desktop/electron/renderer-load-error-page.test.ts
-index e2b6011345..59b75484fc 100644
---- a/apps/desktop/electron/renderer-load-error-page.test.ts
-+++ b/apps/desktop/electron/renderer-load-error-page.test.ts
-@@ -26,9 +26,9 @@ test('error page reload button targets the real renderer URL when provided', ()
-     reloadUrl: 'file:///C:/Hermes%20Agent/dist/index.html'
-   })
- 
--  // A data: page cannot recover with location.reload() (it would re-render
--  // the error page) — the button must navigate back to the app URL.
--  assert.match(html, /location\.replace\("file:\/\/\/C:\/Hermes%20Agent\/dist\/index\.html"\)/)
-+  // A data: page cannot recover with location.reload() (it would re-render the error page),
-+  // and Chromium blocks data: → file:, so a file: target goes through main's reload sentinel.
-+  assert.match(html, /location\.replace\("https:\/\/hermes-desktop-reload\.invalid\/"\)/)
-   assert.doesNotMatch(html, /location\.reload\(\)/)
- })
- 
-@@ -49,7 +49,7 @@ test('reloadUrl cannot break out of the inline script block', () => {
-   // element and inject markup/script into the error page.
-   const html = buildRendererLoadErrorPage({
-     errorDescription: 'load failed',
--    reloadUrl: 'file:///C:/x/index.html</script><script>alert("pwned")</script>'
-+    reloadUrl: 'http://localhost:5173/</script><script>alert("pwned")</script>'
-   })
- 
-   assert.doesNotMatch(html, /<\/script><script>/)
-diff --git a/apps/desktop/electron/renderer-load-error-page.ts b/apps/desktop/electron/renderer-load-error-page.ts
-index d701ab5878..3a676ed9b2 100644
---- a/apps/desktop/electron/renderer-load-error-page.ts
-+++ b/apps/desktop/electron/renderer-load-error-page.ts
-@@ -60,10 +60,16 @@ function escapeInlineScriptJson(value: string): string {
-     .replace(/\u2029/g, '\\u2029')
- }
- 
-+/**
-+ * Chromium refuses a data: page navigating to file:// ("Not allowed to load local resource"),
-+ * so a file: reloadUrl goes through this sentinel instead: main's will-navigate handler cancels
-+ * it and loads the renderer itself.
-+ */
-+export const RENDERER_RELOAD_SENTINEL_URL = 'https://hermes-desktop-reload.invalid/'
-+
- function reloadButtonJs(details: RendererLoadErrorDetails): string {
--  const target = details.reloadUrl
--    ? `location.replace(${escapeInlineScriptJson(JSON.stringify(details.reloadUrl))})`
--    : 'location.reload()'
-+  const href = details.reloadUrl?.startsWith('file:') ? RENDERER_RELOAD_SENTINEL_URL : details.reloadUrl
-+  const target = href ? `location.replace(${escapeInlineScriptJson(JSON.stringify(href))})` : 'location.reload()'
- 
-   return (
-     '<button id="reload" type="button">Reload</button>\n' +
-diff --git a/apps/desktop/electron/window-renderer-lifecycle.test.ts b/apps/desktop/electron/window-renderer-lifecycle.test.ts
-index 599a3a396b..ed1d5b0a65 100644
---- a/apps/desktop/electron/window-renderer-lifecycle.test.ts
-+++ b/apps/desktop/electron/window-renderer-lifecycle.test.ts
-@@ -103,6 +103,10 @@ test('shouldReloadAfterRendererGone never reloads expected teardown or unknown r
-     reload: false,
-     suppressedReason: 'expected-teardown'
-   })
-+  // A live window's renderer exiting 0 is not a normal shutdown — reload it.
-+  assert.deepEqual(shouldReloadAfterRendererGone({ reason: 'clean-exit', isDestroyed: false, recentReloadTimes: [] }), {
-+    reload: true
-+  })
-   assert.deepEqual(
-     shouldReloadAfterRendererGone({ reason: 'launch-failed', isDestroyed: false, recentReloadTimes: [] }),
-     {
-diff --git a/apps/desktop/electron/window-renderer-lifecycle.ts b/apps/desktop/electron/window-renderer-lifecycle.ts
-index 091d137c1b..75f6defb36 100644
---- a/apps/desktop/electron/window-renderer-lifecycle.ts
-+++ b/apps/desktop/electron/window-renderer-lifecycle.ts
-@@ -17,8 +17,8 @@
- //   `isIntentionalTeardown` (expected teardown). Once the budget is spent, a
- //   live window hands off to `onRendererTerminated` so it ends on a visible
- //   recovery affordance rather than a dead window.
--// - `render-process-gone` with other reasons (`launch-failed`, `clean-exit`,
--//   unknown) → log only.
-+// - `render-process-gone` with `clean-exit` on a live window → same bounded reload.
-+// - `render-process-gone` with other reasons (`launch-failed`, unknown) → log only.
- // - `unresponsive` → log only (no reload; Chromium usually follows with
- //   render-process-gone, and forcing a reload while the main thread is wedged
- //   can make things worse).
-@@ -133,7 +133,10 @@ export interface LifecycleWindowLike {
- const DEFAULT_RELOAD_WINDOW_MS = 60_000
- const DEFAULT_RELOAD_MAX = 3
- 
--const RECOVERABLE_REASONS = new Set(['crashed', 'oom', 'killed'])
-+// `clean-exit` on a LIVE window is not a normal shutdown (teardown short-circuits first via
-+// isDestroyed/isIntentionalTeardown): macOS can end a renderer with exit 0 under app-nap/memory
-+// pressure, which used to strand the user on the recovery page. Reload it under the same budget.
-+const RECOVERABLE_REASONS = new Set(['crashed', 'oom', 'killed', 'clean-exit'])
- 
- function safeNow(now: (() => number) | undefined): number {
-   return typeof now === 'function' ? now() : Date.now()

@@ -14,6 +14,10 @@ T3 Code's features for [Hermes Agent](https://github.com/NousResearch/hermes-age
 
 ## Latest changes
 
+- **Inbox Working shelf:** a thread moves to Working the moment you send, even while its agent is still starting (Claude CLI takes a few seconds). Claude Code's own background shells, monitors and subagents keep a thread in Working after its turn ends.
+- **Context meter:** Claude CLI chats refresh the meter from Claude's own `/context` after every turn, not only when the Context panel opens. A reading taken under another model or 200K/1M setting is dropped instead of showing the wrong window (host patch).
+- **Claude accounts button:** Settings ▸ Plugins ▸ T3 Code ▸ Claude CLI can hide it from the status bar. Hiding it also stops its account check.
+- **Keep the host patch through Hermes updates:** see "Updating Hermes" below.
 - **Updated Hermes compatibility:** the host patch is rebased onto `9cb34e9e285dadd0c6d2463e9b094052530fc365`, preserving the new command-discovery/session-registry split and credential-route snapshots. Native turn timing and background-task fields are included in the gateway contracts.
 
 - **Inbox thread mentions:** drag one thread or a selection onto a chat composer to insert `@session:` mentions, or type `@` to search the Inbox roster. Drops target the composer they land on, including tiled chats. The prebuilt Desktop bundle includes this feature.
@@ -76,6 +80,20 @@ git -C ~/.hermes/hermes-agent apply patches/hermes-native-runtime.patch
 ```
 
 If it no longer applies cleanly after a Hermes update, try `git apply --3way`, or port the diff. The patch preserves the current shared command-discovery and session-registry layout and declares native activity fields in the generated gateway contracts. An unrelated Z.ai 429/1311 entitlement fix from the author's machine is **not** included.
+
+## Updating Hermes without losing the host patch
+
+`hermes update` stashes uncommitted source edits, pulls, and re-applies them; a conflict leaves the patch in `git stash` and the native providers stop working. Commit the patch on a branch instead and let the updater merge upstream into it:
+
+```sh
+cd ~/.hermes/hermes-agent
+git switch -c my/host && git add -A && git commit -m "t3code host patch"
+git config rerere.enabled true            # a conflict resolved once stays resolved
+```
+
+Then set `updates.parked_branch_strategy: update_in_place` in `config.yaml` (in every profile that has an `updates:` section, since each profile reads its own). `hermes update` and the Desktop Update button then merge `origin/main` into the branch and never switch away from it. On a merge conflict the update stops and the old code keeps running; resolve it with `git merge origin/main` on the branch and run the update again. Keep the source tree clean: an uncommitted file makes the updater skip the code update.
+
+Maintainers: `sh sync-host-patch.sh [branch] [new/path ...]` rebuilds `patches/hermes-native-runtime.patch` from the branch, checks that it applies to a clean upstream tree, and stamps `SOURCE.json`.
 
 ## Layout
 

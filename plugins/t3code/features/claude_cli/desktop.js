@@ -1,7 +1,7 @@
 import React from 'react'
 import * as sdk from '@hermes/plugin-sdk'
 const {
-  host, useValue, useQuery, queryClient, surfaceModelSwitchConfirm,
+  host, atom, useValue, useQuery, queryClient, surfaceModelSwitchConfirm,
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent,
   DropdownMenuItem, DropdownMenuSeparator
 } = sdk
@@ -10,6 +10,8 @@ const h = React.createElement
 const QUERY = 't3code-claude-context'
 const ACCOUNTS_QUERY = 't3code-claude-accounts'
 let featureCtx = null
+// Status-bar visibility of the Claude accounts button (local Desktop pref, applies live).
+let $showAccounts = atom(true)
 const CLAUDE_PROVIDERS = ['claude-cli', 'claude-cli-2']
 
 function hasNativeMillion(model) {
@@ -135,11 +137,30 @@ function AccountsPanel() {
         'Choose Claude CLI for account A or Claude CLI 2 for account B in a new chat’s model picker. Existing chats stay bound to their account.')))
 }
 
+// Unmounting the panel (not hiding it) also stops its account poll.
+function AccountsSlot() {
+  return useValue($showAccounts) ? h(AccountsPanel) : null
+}
+
+function SettingsPage() {
+  const show = useValue($showAccounts)
+  return h('label', { style: { display: 'flex', gap: 8, alignItems: 'flex-start', padding: 4 } },
+    h('input', {
+      type: 'checkbox', checked: show,
+      onChange: e => { $showAccounts.set(e.target.checked); featureCtx.storage.set('showAccounts', e.target.checked) }
+    }),
+    h('span', null, 'Show Claude accounts in the status bar',
+      h('div', { style: { fontSize: 12, color: 'var(--ui-text-tertiary)' } },
+        'The "Claude" button listing account A and B sign-in status. The 200K/1M context picker stays either way.')))
+}
+
 export default {
   register(ctx) {
     featureCtx = ctx
+    $showAccounts = atom(ctx.storage.get('showAccounts', true) !== false)
     ctx.register({ id: 'context-window', area: 'statusBar.right', order: -10, render: () => h(ContextPicker) })
-    ctx.register({ id: 'claude-accounts', area: 'statusBar.right', order: -9, render: () => h(AccountsPanel) })
+    ctx.register({ id: 'claude-accounts', area: 'statusBar.right', order: -9, render: () => h(AccountsSlot) })
+    ctx.registerSettingsPage?.({ icon: 'user', id: 'settings', render: () => h(SettingsPage), title: 'Claude CLI' })
     ctx.onEvent('session.info', () => {
       void queryClient.invalidateQueries({ queryKey: [QUERY] })
     })

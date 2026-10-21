@@ -147,6 +147,8 @@ not replace it.
 
 Re-run Steps 2–3 on a fresh clone/pull. If Hermes itself was updated, Step 2 decides whether
 the patch still applies. The Desktop bundle hot-reloads; Python changes need a backend restart.
+To make the patch survive future Hermes updates, offer the user the branch setup in README.md
+("Updating Hermes without losing the host patch"); do not set it up without their consent.
 
 ## Uninstall
 
