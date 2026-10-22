@@ -2864,7 +2864,8 @@ function InboxPane() {
     placeholderData: (previous) => previous,
     queryFn: () => fetchSessions(conn, Boolean(prefs.includeCron), historyLimit),
     queryKey: [NS, "sessions", conn, Boolean(prefs.includeCron), historyLimit],
-    refetchInterval: 15e3,
+    // Battery: live turn state has its own poll; the roster only needs to be fresh while looked at.
+    refetchInterval: () => document.hasFocus() ? 15e3 : 6e4,
     staleTime: 5e3
   });
   const sessions = data?.sessions || [];
@@ -4808,14 +4809,27 @@ function UsageGraft() {
       }
     };
     const observer = new MutationObserver(tick);
-    observer.observe(document.body, { childList: true, subtree: true });
-    tick();
-    window.addEventListener("hashchange", tick);
-    window.addEventListener("popstate", tick);
+    const nav = window.navigation;
+    let observing = false;
+    const sync = () => {
+      const want = !nav || isCommandCenterUsage();
+      if (want && !observing) {
+        observer.observe(document.body, { childList: true, subtree: true });
+      } else if (!want && observing) {
+        observer.disconnect();
+      }
+      observing = want;
+      tick();
+    };
+    sync();
+    nav?.addEventListener("currententrychange", sync);
+    window.addEventListener("hashchange", sync);
+    window.addEventListener("popstate", sync);
     return () => {
       observer.disconnect();
-      window.removeEventListener("hashchange", tick);
-      window.removeEventListener("popstate", tick);
+      nav?.removeEventListener("currententrychange", sync);
+      window.removeEventListener("hashchange", sync);
+      window.removeEventListener("popstate", sync);
       release2();
     };
   }, []);
@@ -5329,12 +5343,15 @@ var desktop_default5 = {
 // features/battery/desktop.js
 var HOLD_ATTR = "data-t3-battery-hold";
 var IDLE_MS = 3e4;
-var BEAT_MS = 1e3;
+var IDLE_BEAT_MS = 1e3;
+var CAPPED_MS = 100;
 var CHECK_MS = 5e3;
 var CSS4 = `[${HOLD_ATTR}],[${HOLD_ATTR}]::before,[${HOLD_ATTR}]::after{animation-play-state:paused!important}`;
 var held = /* @__PURE__ */ new Set();
-var idle = false;
+var mode = "live";
+var onBattery = false;
 var lastInput = Date.now();
+var beatTimer = 0;
 var isLooping = (a) => a.effect?.getTiming?.().iterations === Infinity && a.effect?.target?.setAttribute;
 function holdRunning() {
   for (const a of document.getAnimations()) {
@@ -5344,12 +5361,12 @@ function holdRunning() {
     }
   }
 }
-function beat() {
+function step(ms) {
   for (const a of held) {
     if (!a.effect?.target?.isConnected || a.playState === "idle") {
       held.delete(a);
     } else if (a.playState === "paused") {
-      a.currentTime = (a.currentTime || 0) + BEAT_MS;
+      a.currentTime = (a.currentTime || 0) + ms;
     }
   }
   holdRunning();
@@ -5360,33 +5377,59 @@ function release() {
   }
   held = /* @__PURE__ */ new Set();
 }
-function shouldIdle() {
-  return document.hidden || !document.hasFocus() || Date.now() - lastInput > IDLE_MS;
-}
-function update() {
-  const next = shouldIdle();
-  if (next === idle) {
+function scheduleBeat() {
+  window.clearTimeout(beatTimer);
+  beatTimer = 0;
+  if (mode === "live" || document.hidden) {
     return;
   }
-  idle = next;
-  idle ? holdRunning() : release();
+  const ms = mode === "capped" ? CAPPED_MS : IDLE_BEAT_MS;
+  beatTimer = window.setTimeout(() => {
+    step(ms);
+    scheduleBeat();
+  }, ms);
+}
+function nextMode() {
+  if (document.hidden || !document.hasFocus() || Date.now() - lastInput > IDLE_MS) {
+    return "idle";
+  }
+  return onBattery ? "capped" : "live";
+}
+function update() {
+  const next = nextMode();
+  if (next !== mode) {
+    mode = next;
+    mode === "live" ? release() : holdRunning();
+  }
+  scheduleBeat();
 }
 function onInput() {
   lastInput = Date.now();
-  if (idle) {
+  if (mode === "idle") {
     update();
   }
 }
 var desktop_default6 = {
   register(ctx) {
     held = /* @__PURE__ */ new Set();
-    idle = false;
+    mode = "live";
+    onBattery = false;
     lastInput = Date.now();
     const style = document.createElement("style");
     style.dataset.t3Battery = "";
     style.textContent = CSS4;
     document.head.appendChild(style);
+    const desktop = window.hermesDesktop;
+    const setPower = (value) => {
+      onBattery = Boolean(value);
+      update();
+    };
+    void desktop?.getOnBattery?.().then(setPower, () => {
+    });
+    const unsubscribePower = desktop?.onBatteryChanged?.(setPower);
     ctx.onDispose(() => {
+      window.clearTimeout(beatTimer);
+      unsubscribePower?.();
       release();
       style.remove();
     });
@@ -5397,7 +5440,6 @@ var desktop_default6 = {
     ctx.addEventListener(window, "blur", update);
     ctx.addEventListener(document, "visibilitychange", update);
     ctx.setInterval(update, CHECK_MS);
-    ctx.setInterval(() => idle && !document.hidden && beat(), BEAT_MS);
     update();
   }
 };

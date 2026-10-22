@@ -1,5 +1,5 @@
 /**
- * Battery saver: stop Hermes redrawing at the display's refresh rate while nobody is looking.
+ * Battery saver: stop Hermes redrawing at the display's refresh rate.
  *
  * Measured 22.10.2026 on a 120 Hz MacBook during a running turn: the core "Working" shimmer, the
  * core glyph spinner and the inbox row spinner kept the renderer at 38 %, the GPU process at 22 % and
@@ -8,21 +8,28 @@
  * Core only pauses them when the window is hidden or minimized, not when it sits visible behind
  * another app.
  *
- * Idle = the window lost focus, is hidden, or got no input for IDLE_MS. While idle every running
- * infinite CSS animation is held (CSS play-state, so core's own pause rules keep working) and stepped
- * forward once per BEAT_MS: spinners still move at 1 fps instead of looking hung. Any input or focus
- * releases them at once. Finite animations (fades, pops, entrances) are never touched.
+ * Three modes:
+ *  - live: on AC power and in use. Animations run untouched.
+ *  - capped: on battery and in use. Every running infinite CSS animation is held (CSS play-state,
+ *    so core's own pause rules keep working) and stepped forward every CAPPED_MS: 10 fps instead
+ *    of 120, which still reads as motion.
+ *  - idle: the window lost focus, is hidden, or got no input for IDLE_MS. Same hold, stepped once
+ *    per IDLE_MS_BEAT so spinners still move instead of looking hung.
+ * Any input or focus returns to live/capped at once. Finite animations (fades, pops) are never touched.
  */
 const HOLD_ATTR = 'data-t3-battery-hold'
 const IDLE_MS = 30_000
-const BEAT_MS = 1_000
+const IDLE_BEAT_MS = 1_000
+const CAPPED_MS = 100
 const CHECK_MS = 5_000
 
 const CSS = `[${HOLD_ATTR}],[${HOLD_ATTR}]::before,[${HOLD_ATTR}]::after{animation-play-state:paused!important}`
 
 let held = new Set()
-let idle = false
+let mode = 'live'
+let onBattery = false
 let lastInput = Date.now()
+let beatTimer = 0
 
 const isLooping = a => a.effect?.getTiming?.().iterations === Infinity && a.effect?.target?.setAttribute
 
@@ -36,12 +43,12 @@ function holdRunning() {
 }
 
 // Seeking keeps CSS in charge of play-state (pause()/play() would take it over for good).
-function beat() {
+function step(ms) {
   for (const a of held) {
     if (!a.effect?.target?.isConnected || a.playState === 'idle') {
       held.delete(a)
     } else if (a.playState === 'paused') {
-      a.currentTime = (a.currentTime || 0) + BEAT_MS
+      a.currentTime = (a.currentTime || 0) + ms
     }
   }
   holdRunning()
@@ -54,25 +61,46 @@ function release() {
   held = new Set()
 }
 
-function shouldIdle() {
-  return document.hidden || !document.hasFocus() || Date.now() - lastInput > IDLE_MS
-}
+// One timer, re-armed per beat, so live mode and hidden windows cost no wakeups at all.
+function scheduleBeat() {
+  window.clearTimeout(beatTimer)
+  beatTimer = 0
 
-function update() {
-  const next = shouldIdle()
-
-  if (next === idle) {
+  if (mode === 'live' || document.hidden) {
     return
   }
 
-  idle = next
-  idle ? holdRunning() : release()
+  const ms = mode === 'capped' ? CAPPED_MS : IDLE_BEAT_MS
+
+  beatTimer = window.setTimeout(() => {
+    step(ms)
+    scheduleBeat()
+  }, ms)
+}
+
+function nextMode() {
+  if (document.hidden || !document.hasFocus() || Date.now() - lastInput > IDLE_MS) {
+    return 'idle'
+  }
+
+  return onBattery ? 'capped' : 'live'
+}
+
+function update() {
+  const next = nextMode()
+
+  if (next !== mode) {
+    mode = next
+    mode === 'live' ? release() : holdRunning()
+  }
+
+  scheduleBeat()
 }
 
 function onInput() {
   lastInput = Date.now()
 
-  if (idle) {
+  if (mode === 'idle') {
     update()
   }
 }
@@ -80,14 +108,27 @@ function onInput() {
 export default {
   register(ctx) {
     held = new Set()
-    idle = false
+    mode = 'live'
+    onBattery = false
     lastInput = Date.now()
 
     const style = document.createElement('style')
     style.dataset.t3Battery = ''
     style.textContent = CSS
     document.head.appendChild(style)
+
+    const desktop = window.hermesDesktop
+    const setPower = value => {
+      onBattery = Boolean(value)
+      update()
+    }
+
+    void desktop?.getOnBattery?.().then(setPower, () => {})
+    const unsubscribePower = desktop?.onBatteryChanged?.(setPower)
+
     ctx.onDispose(() => {
+      window.clearTimeout(beatTimer)
+      unsubscribePower?.()
       release()
       style.remove()
     })
@@ -99,7 +140,6 @@ export default {
     ctx.addEventListener(window, 'blur', update)
     ctx.addEventListener(document, 'visibilitychange', update)
     ctx.setInterval(update, CHECK_MS)
-    ctx.setInterval(() => idle && !document.hidden && beat(), BEAT_MS)
     update()
   }
 }

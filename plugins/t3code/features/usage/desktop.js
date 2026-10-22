@@ -1031,17 +1031,36 @@ function UsageGraft() {
     }
 
     // React's overlay commit is observed in a microtask, before browser paint.
-    // This also catches pushState navigation, which emits no hashchange.
+    // Battery: a subtree observer on <body> fires on every streamed token, so it
+    // only runs while the Usage page is open. The Navigation API reports
+    // pushState navigation too (no hashchange); without it, observe always.
     const observer = new MutationObserver(tick)
-    observer.observe(document.body, { childList: true, subtree: true })
-    tick()
-    window.addEventListener('hashchange', tick)
-    window.addEventListener('popstate', tick)
+    const nav = window.navigation
+    let observing = false
+
+    const sync = () => {
+      const want = !nav || isCommandCenterUsage()
+
+      if (want && !observing) {
+        observer.observe(document.body, { childList: true, subtree: true })
+      } else if (!want && observing) {
+        observer.disconnect()
+      }
+
+      observing = want
+      tick()
+    }
+
+    sync()
+    nav?.addEventListener('currententrychange', sync)
+    window.addEventListener('hashchange', sync)
+    window.addEventListener('popstate', sync)
 
     return () => {
       observer.disconnect()
-      window.removeEventListener('hashchange', tick)
-      window.removeEventListener('popstate', tick)
+      nav?.removeEventListener('currententrychange', sync)
+      window.removeEventListener('hashchange', sync)
+      window.removeEventListener('popstate', sync)
       release()
     }
   }, [])

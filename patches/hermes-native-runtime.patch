@@ -1,5 +1,5 @@
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index 59006475de..2e4e7165e7 100644
+index 59006475ded..2e4e7165e76 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
 @@ -1032,6 +1032,15 @@ def _build_client(agent, api_key, base_url, fallback_model):
@@ -61,7 +61,7 @@ index 59006475de..2e4e7165e7 100644
  __all__ = ["init_agent"]
 diff --git a/agent/agent_init_snapshot.py b/agent/agent_init_snapshot.py
 new file mode 100644
-index 0000000000..f398a20a5b
+index 00000000000..f398a20a5b4
 --- /dev/null
 +++ b/agent/agent_init_snapshot.py
 @@ -0,0 +1,32 @@
@@ -98,7 +98,7 @@ index 0000000000..f398a20a5b
 +            "is_anthropic_oauth": agent._is_anthropic_oauth,
 +        })
 diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
-index 36f9d4b982..fb0e835fec 100644
+index 36f9d4b9825..fb0e835fec4 100644
 --- a/agent/agent_runtime_helpers.py
 +++ b/agent/agent_runtime_helpers.py
 @@ -2408,22 +2408,6 @@ def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
@@ -155,7 +155,7 @@ index 36f9d4b982..fb0e835fec 100644
  def _pre_tool_block_message(agent, function_name, function_args, effective_task_id, tool_call_id, middleware_trace):
 diff --git a/agent/agent_runtime_helpers_billing.py b/agent/agent_runtime_helpers_billing.py
 new file mode 100644
-index 0000000000..b05b650f93
+index 00000000000..b05b650f934
 --- /dev/null
 +++ b/agent/agent_runtime_helpers_billing.py
 @@ -0,0 +1,20 @@
@@ -180,7 +180,7 @@ index 0000000000..b05b650f93
 +    except Exception:
 +        logger.warning("Failed to persist billing route after model switch", exc_info=True)
 diff --git a/agent/context_breakdown.py b/agent/context_breakdown.py
-index 6d9fedec6c..6499d8ce2e 100644
+index 6d9fedec6c5..6499d8ce2ed 100644
 --- a/agent/context_breakdown.py
 +++ b/agent/context_breakdown.py
 @@ -209,6 +209,37 @@ def compute_session_context_breakdown(agent: Any, messages: Optional[list[dict]]
@@ -222,7 +222,7 @@ index 6d9fedec6c..6499d8ce2e 100644
      """Expanded per-skill / per-toolset cost listing for ``/context all``.
  
 diff --git a/agent/conversation_compression_manual.py b/agent/conversation_compression_manual.py
-index 214a605cb0..032a570c94 100644
+index 214a605cb02..032a570c941 100644
 --- a/agent/conversation_compression_manual.py
 +++ b/agent/conversation_compression_manual.py
 @@ -92,6 +92,10 @@ def compress_now(
@@ -237,7 +237,7 @@ index 214a605cb0..032a570c94 100644
      before_tokens = estimate_request_tokens(agent, before)
      head, tail = before, []
 diff --git a/agent/interrupt_control.py b/agent/interrupt_control.py
-index af647a1c4f..38c71cf79c 100644
+index af647a1c4f1..38c71cf79c0 100644
 --- a/agent/interrupt_control.py
 +++ b/agent/interrupt_control.py
 @@ -128,6 +128,18 @@ def _ic_codex_method(agent, name: str):
@@ -290,7 +290,7 @@ index af647a1c4f..38c71cf79c 100644
          if _native_steer is not None:
 diff --git a/agent/native_commands.py b/agent/native_commands.py
 new file mode 100644
-index 0000000000..514b91a2ae
+index 00000000000..514b91a2aed
 --- /dev/null
 +++ b/agent/native_commands.py
 @@ -0,0 +1,121 @@
@@ -417,10 +417,10 @@ index 0000000000..514b91a2ae
 +    return prefix + inner
 diff --git a/agent/native_runtime.py b/agent/native_runtime.py
 new file mode 100644
-index 0000000000..b3da70ccf1
+index 00000000000..8cfc28370c1
 --- /dev/null
 +++ b/agent/native_runtime.py
-@@ -0,0 +1,349 @@
+@@ -0,0 +1,369 @@
 +"""Host boundary for plugin-owned agent loops. Native history is never replayed from the mirror."""
 +
 +from __future__ import annotations
@@ -482,6 +482,26 @@ index 0000000000..b3da70ccf1
 +    agent._native_runtime = None
 +    if runtime is not None:
 +        runtime.close()
++
++
++# Battery/RAM: an idle native CLI process (Claude CLI, Muse Code; ~350 MB each) closes after this.
++NATIVE_RUNTIME_IDLE_SECS = 600.0
++
++
++def park_if_idle(agent: Any, idle_since: float | None, now: float) -> bool:
++    """Close ``agent``'s native CLI process on a daemon thread when it has been idle past
++    ``NATIVE_RUNTIME_IDLE_SECS`` with no native background work pending. The caller has already
++    ruled out a running turn. The next turn resumes the native session (``_ensure_runtime``)."""
++    runtime = getattr(agent, "_native_runtime", None)
++    if runtime is None or idle_since is None or now - idle_since <= NATIVE_RUNTIME_IDLE_SECS:
++        return False
++    try:
++        if getattr(runtime, "background_task_count", lambda: 0)():
++            return False
++    except Exception:
++        return False
++    threading.Thread(target=close_runtime, args=(agent,), daemon=True, name="native-idle-close").start()
++    return True
 +
 +
 +def native_context(agent: Any, *, refresh: bool = False) -> dict:
@@ -771,7 +791,7 @@ index 0000000000..b3da70ccf1
 +            "failed": bool(error), "error": error, "interrupted": interrupted,
 +            "api_calls": int((terminal or {}).get("api_calls") or bool(terminal)), "agent_persisted": True, **usage}
 diff --git a/agent/turn_facade.py b/agent/turn_facade.py
-index 3830058dce..66b1307a63 100644
+index 3830058dce4..66b1307a63f 100644
 --- a/agent/turn_facade.py
 +++ b/agent/turn_facade.py
 @@ -44,6 +44,8 @@ class TurnFacadeMixin:
@@ -784,7 +804,7 @@ index 3830058dce..66b1307a63 100644
              reset_affinity_scope, reset_conversation_context, set_affinity_scope,
              set_conversation_context,
 diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
-index 1eac74c94c..d29ae2e9f5 100644
+index 1eac74c94cd..d29ae2e9f5e 100644
 --- a/apps/desktop/electron/main.ts
 +++ b/apps/desktop/electron/main.ts
 @@ -541,7 +541,7 @@ import {
@@ -827,7 +847,7 @@ index 1eac74c94c..d29ae2e9f5 100644
      void openExternalUrl(url)
    })
 diff --git a/apps/desktop/electron/renderer-load-error-page.test.ts b/apps/desktop/electron/renderer-load-error-page.test.ts
-index e2b6011345..59b75484fc 100644
+index e2b60113458..59b75484fcf 100644
 --- a/apps/desktop/electron/renderer-load-error-page.test.ts
 +++ b/apps/desktop/electron/renderer-load-error-page.test.ts
 @@ -26,9 +26,9 @@ test('error page reload button targets the real renderer URL when provided', ()
@@ -853,7 +873,7 @@ index e2b6011345..59b75484fc 100644
  
    assert.doesNotMatch(html, /<\/script><script>/)
 diff --git a/apps/desktop/electron/renderer-load-error-page.ts b/apps/desktop/electron/renderer-load-error-page.ts
-index d701ab5878..3a676ed9b2 100644
+index d701ab58788..3a676ed9b24 100644
 --- a/apps/desktop/electron/renderer-load-error-page.ts
 +++ b/apps/desktop/electron/renderer-load-error-page.ts
 @@ -60,10 +60,16 @@ function escapeInlineScriptJson(value: string): string {
@@ -877,7 +897,7 @@ index d701ab5878..3a676ed9b2 100644
    return (
      '<button id="reload" type="button">Reload</button>\n' +
 diff --git a/apps/desktop/electron/window-renderer-lifecycle.test.ts b/apps/desktop/electron/window-renderer-lifecycle.test.ts
-index 599a3a396b..ed1d5b0a65 100644
+index 599a3a396b7..ed1d5b0a653 100644
 --- a/apps/desktop/electron/window-renderer-lifecycle.test.ts
 +++ b/apps/desktop/electron/window-renderer-lifecycle.test.ts
 @@ -103,6 +103,10 @@ test('shouldReloadAfterRendererGone never reloads expected teardown or unknown r
@@ -892,7 +912,7 @@ index 599a3a396b..ed1d5b0a65 100644
      shouldReloadAfterRendererGone({ reason: 'launch-failed', isDestroyed: false, recentReloadTimes: [] }),
      {
 diff --git a/apps/desktop/electron/window-renderer-lifecycle.ts b/apps/desktop/electron/window-renderer-lifecycle.ts
-index 091d137c1b..75f6defb36 100644
+index 091d137c1be..75f6defb369 100644
 --- a/apps/desktop/electron/window-renderer-lifecycle.ts
 +++ b/apps/desktop/electron/window-renderer-lifecycle.ts
 @@ -17,8 +17,8 @@
@@ -919,7 +939,7 @@ index 091d137c1b..75f6defb36 100644
  function safeNow(now: (() => number) | undefined): number {
    return typeof now === 'function' ? now() : Date.now()
 diff --git a/apps/desktop/src/components/assistant-ui/thread/status.tsx b/apps/desktop/src/components/assistant-ui/thread/status.tsx
-index d9ebf1575f..70ab7833ce 100644
+index d9ebf1575f4..70ab7833cec 100644
 --- a/apps/desktop/src/components/assistant-ui/thread/status.tsx
 +++ b/apps/desktop/src/components/assistant-ui/thread/status.tsx
 @@ -358,10 +358,10 @@ const TurnActivityRow: FC<TurnActivityRowProps> = ({ active, elapsed, hint, loca
@@ -958,7 +978,7 @@ index d9ebf1575f..70ab7833ce 100644
    // Once the row has been shown, keep its live region mounted across
    // quiet/working flips: remounting a role="status" node makes screen readers
 diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
-index c09bab4435..71008f3f2b 100644
+index c09bab44355..71008f3f2ba 100644
 --- a/apps/shared/src/gateway-contract.generated.ts
 +++ b/apps/shared/src/gateway-contract.generated.ts
 @@ -3284,6 +3284,8 @@ export interface SessionActiveItem {
@@ -971,7 +991,7 @@ index c09bab4435..71008f3f2b 100644
  export type LiveSessionStatus = 'idle' | 'starting' | 'waiting' | 'working' | 'streaming' | 'resuming'
  /** ``session_id`` is the STORED id. */
 diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
-index 5c84266469..77effe4370 100644
+index 5c84266469e..77effe43705 100644
 --- a/apps/shared/src/gateway-contract.openrpc.json
 +++ b/apps/shared/src/gateway-contract.openrpc.json
 @@ -34697,6 +34697,23 @@
@@ -998,8 +1018,29 @@ index 5c84266469..77effe4370 100644
            }
          },
          "required": [
+diff --git a/gateway/run_agent_cache.py b/gateway/run_agent_cache.py
+index d1d86da165e..0f405dbe741 100644
+--- a/gateway/run_agent_cache.py
++++ b/gateway/run_agent_cache.py
+@@ -1146,4 +1146,16 @@ class GatewayAgentCacheMixin:
+             logger.info("Agent cache idle-TTL evict: session=%s (idle=%.0fs)", key, now - getattr(agent, "_last_activity_ts", now))
+             self._spawn_release_thread(self._commit_then_release_soft, (agent, key), f"agent-cache-idle-{key[:24]}",
+                                        inline_fallback=False, session_key=key)
++        self._park_idle_native_runtimes(now, running_ids)
+         return len(to_evict)
++
++    def _park_idle_native_runtimes(self, now: float, running_ids: set) -> None:
++        """Close the CLI process behind an idle cached native-runtime agent; the agent stays cached."""
++        from agent.native_runtime import park_if_idle
++
++        with self._agent_cache_lock:
++            agents = [(key, _tuple_agent(entry)) for key, entry in self._agent_cache.items()]
++        for key, agent in agents:
++            if agent is not None and id(agent) not in running_ids and park_if_idle(
++                    agent, getattr(agent, "_last_activity_ts", None), now):
++                logger.info("Native runtime idle close: session=%s", key)
 diff --git a/providers/base.py b/providers/base.py
-index 9183cf3074..7a3a8ad6de 100644
+index 9183cf3074e..7a3a8ad6de4 100644
 --- a/providers/base.py
 +++ b/providers/base.py
 @@ -108,6 +108,9 @@ class ProviderProfile:
@@ -1024,7 +1065,7 @@ index 9183cf3074..7a3a8ad6de 100644
          """External-process providers: ``{available, logged_in, plan, detail, login_command}`` from the
          CLI itself so setup can gate on login. ``None`` = nothing to report beyond executable presence."""
 diff --git a/run_agent.py b/run_agent.py
-index 86fa471ed1..be888a362e 100644
+index 86fa471ed1a..be888a362e6 100644
 --- a/run_agent.py
 +++ b/run_agent.py
 @@ -993,8 +993,10 @@ class AIAgent(
@@ -1040,7 +1081,7 @@ index 86fa471ed1..be888a362e 100644
          if codex_session is not None:
              self._codex_session = None
 diff --git a/tui_gateway/contracts/sessions.py b/tui_gateway/contracts/sessions.py
-index 2ed546a01f..24f03d97f8 100644
+index 2ed546a01f4..24f03d97f8b 100644
 --- a/tui_gateway/contracts/sessions.py
 +++ b/tui_gateway/contracts/sessions.py
 @@ -282,6 +282,8 @@ class SessionActiveItem(Result):
@@ -1053,7 +1094,7 @@ index 2ed546a01f..24f03d97f8 100644
  
  class SessionActiveListResult(Result):
 diff --git a/tui_gateway/methods_complete.py b/tui_gateway/methods_complete.py
-index 43ac54229c..0f6fc3eacb 100644
+index 43ac54229cf..0f6fc3eacbf 100644
 --- a/tui_gateway/methods_complete.py
 +++ b/tui_gateway/methods_complete.py
 @@ -286,7 +286,19 @@ def _(rid, params: dict) -> dict:
@@ -1078,7 +1119,7 @@ index 43ac54229c..0f6fc3eacb 100644
  
  def _session_agent(params: dict):
 diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
-index dc0d807adc..0e8b458fdc 100644
+index dc0d807adc7..0e8b458fdc2 100644
 --- a/tui_gateway/methods_session.py
 +++ b/tui_gateway/methods_session.py
 @@ -1470,6 +1470,12 @@ def _(rid, params: dict, session: dict) -> dict:
@@ -1134,7 +1175,7 @@ index dc0d807adc..0e8b458fdc 100644
          with _manual_compress_turn(sid, session):
              return _compress_live(rid, sid, session, _str_param(params, "focus_topic"))
 diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
-index 6b37fc3e18..c8de5b10e9 100644
+index 6b37fc3e18c..c8de5b10e98 100644
 --- a/tui_gateway/methods_tools.py
 +++ b/tui_gateway/methods_tools.py
 @@ -426,6 +426,28 @@ def _(rid, params: dict) -> dict:
@@ -1238,7 +1279,7 @@ index 6b37fc3e18..c8de5b10e9 100644
          return _methods["command.dispatch"](rid, {"name": target.lstrip("/"), "arg": arg, "session_id": sid})
      # Recognized skills keep the 4018 gate so clients command.dispatch. A scan
 diff --git a/tui_gateway/server.py b/tui_gateway/server.py
-index e4a18e4ff4..21e9a60203 100644
+index e4a18e4ff40..21e9a602038 100644
 --- a/tui_gateway/server.py
 +++ b/tui_gateway/server.py
 @@ -1401,6 +1401,10 @@ def _get_usage(agent) -> dict:
@@ -1253,7 +1294,7 @@ index e4a18e4ff4..21e9a60203 100644
      # data (Codex reports no latency; zero cache reads shows no hit% rather than an alarming 0).
      with contextlib.suppress(Exception):
 diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
-index ba20b94d41..ae09ac1283 100644
+index ba20b94d41b..ae09ac12832 100644
 --- a/tui_gateway/session_auto_continue.py
 +++ b/tui_gateway/session_auto_continue.py
 @@ -68,6 +68,12 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
@@ -1269,8 +1310,46 @@ index ba20b94d41..ae09ac1283 100644
      # Ownership, not forensics: a sibling backend sharing this HERMES_HOME can be mid-turn on this very session, so
      # its live marker says "someone is working on it", never "someone crashed". Leave the marker for its writer —
      # clearing it would cancel the live turn's own account of itself. See #94778.
+diff --git a/tui_gateway/session_reaper.py b/tui_gateway/session_reaper.py
+index 6c6eb4c286f..4f16ddcbf31 100644
+--- a/tui_gateway/session_reaper.py
++++ b/tui_gateway/session_reaper.py
+@@ -268,6 +268,7 @@ def _reap_idle_sessions() -> None:
+         _close_session_by_id(
+             sid, end_reason="idle_timeout",
+             predicate=lambda session, vs=sid: _session_is_evictable(vs, session, time.time()))
++    _park_idle_native_sessions(now)
+     _repair_missing_ws_orphan_reaps()
+     _enforce_session_cap()
+     _reclaim_orphaned_leases()
+@@ -284,6 +285,25 @@ def _reap_idle_sessions() -> None:
+         logger.debug("idle reaper memory trim failed: %s: %s", type(exc).__name__, exc)
+ 
+ 
++def _park_idle_native_sessions(now: float) -> None:
++    """Battery/RAM: a Desktop chat keeps its live transport, so TTL eviction never reaches it; close
++    just the native CLI process (Claude CLI, Muse Code) once idle. The session stays open and the
++    next turn resumes the native session."""
++    from agent.native_runtime import park_if_idle
++
++    with _sessions_lock:
++        candidates = [(sid, s) for sid, s in _sessions.items()
++                      if getattr(s.get("agent"), "_native_runtime", None) is not None]
++    for sid, session in candidates:
++        if session.get("running") or _session_pending_kind(sid) or _session_has_active_delegations(sid, session):
++            continue
++        agent = session["agent"]
++        idle_since = max(float(session.get("last_active") or 0.0),
++                         float(getattr(agent, "_last_activity_ts", 0.0) or 0.0)) or None
++        if park_if_idle(agent, idle_since, now):
++            logger.info("native runtime idle close: session=%s", sid)
++
++
+ def _repair_missing_ws_orphan_reaps() -> None:
+     """Re-arm detached sessions whose disconnect path lost its teardown timer.
+ 
 diff --git a/tui_gateway/session_registry.py b/tui_gateway/session_registry.py
-index 4d96df74c3..a3ce480e6c 100644
+index 4d96df74c31..a3ce480e6c5 100644
 --- a/tui_gateway/session_registry.py
 +++ b/tui_gateway/session_registry.py
 @@ -662,6 +662,15 @@ def _session_live_title(session: dict, key: str) -> str:
@@ -1301,7 +1380,7 @@ index 4d96df74c3..a3ce480e6c 100644
  
 diff --git a/website/docs/developer-guide/plugins/agent-runtime-plugin.md b/website/docs/developer-guide/plugins/agent-runtime-plugin.md
 new file mode 100644
-index 0000000000..e984c5a8cb
+index 00000000000..e984c5a8cbf
 --- /dev/null
 +++ b/website/docs/developer-guide/plugins/agent-runtime-plugin.md
 @@ -0,0 +1,68 @@

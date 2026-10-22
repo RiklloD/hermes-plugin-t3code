@@ -3710,7 +3710,8 @@ function InboxPane() {
     placeholderData: previous => previous,
     queryFn: () => fetchSessions(conn, Boolean(prefs.includeCron), historyLimit),
     queryKey: [NS, 'sessions', conn, Boolean(prefs.includeCron), historyLimit],
-    refetchInterval: 15_000,
+    // Battery: live turn state has its own poll; the roster only needs to be fresh while looked at.
+    refetchInterval: () => (document.hasFocus() ? 15_000 : 60_000),
     staleTime: 5_000
   })
 
