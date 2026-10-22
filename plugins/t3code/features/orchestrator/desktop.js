@@ -429,7 +429,7 @@ export default {
     ctxRef = ctx
     $now = atom(Date.now())
     $tasks = atom({})
-    ctx.setInterval(() => $now.set(Date.now()), 1000)
+    ctx.setInterval(() => !document.hidden && $now.set(Date.now()), 1000)
     ctx.setInterval(() => !document.hidden && void refreshTasks(), 30_000)
     void refreshTasks()
 

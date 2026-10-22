@@ -2046,7 +2046,7 @@ function WorkingTimer({ since }) {
       return undefined
     }
 
-    const id = window.setInterval(() => setNow(Date.now()), 1_000)
+    const id = window.setInterval(() => !document.hidden && setNow(Date.now()), 1_000)
 
     return () => window.clearInterval(id)
   }, [since])
@@ -4244,18 +4244,20 @@ export default {
     // Coarse clock for relative ages, snooze expiry and auto-settle; working
     // timers tick themselves and snooze wakes are scheduled exactly.
     ctx.setInterval(() => $tick.set(Date.now()), 15_000)
-    // Live turn state for the sources we can reach (skipped while hidden; every 10 s instead of 3 s
-    // while Hermes sits unfocused, since each poll is two calls per opened profile).
+    // Live turn state for the sources we can reach: every 3 s focused, 10 s unfocused, 60 s hidden
+    // (each poll is two calls per opened profile). Hidden still polls so recovery sees fresh state.
     let polledAt = 0
     ctx.setInterval(() => {
-      if (document.hasFocus() || Date.now() - polledAt >= 10_000) {
+      const every = document.hidden ? 60_000 : document.hasFocus() ? 0 : 10_000
+      if (Date.now() - polledAt >= every) {
         polledAt = Date.now()
         void pollLive()
       }
     }, 3_000)
     void pollLive()
-    // Resume threads a crash or a usage limit stopped (see "recovery" above).
-    ctx.setInterval(() => void runRecovery(), 10_000)
+    // Resume threads a crash or a usage limit stopped (see "recovery" above). Limits reset on
+    // the hour scale, so 30 s is plenty.
+    ctx.setInterval(() => void runRecovery(), 30_000)
     // Shared lifecycle: pull on load, then periodically and on return to the window.
     void pullLifecycle()
     ctx.setInterval(() => !document.hidden && void pullLifecycle(), 60_000)
@@ -4266,8 +4268,10 @@ export default {
         void pullLifecycle()
       }
     })
-    // Mirror unsent new-chat text into the Drafts shelf.
-    ctx.setInterval(() => !document.hidden && syncDrafts(), 1_000)
+    // Mirror unsent new-chat text into the Drafts shelf. Only typing changes it, so poll only while
+    // focused and catch the last keystrokes on blur.
+    ctx.setInterval(() => document.hasFocus() && syncDrafts(), 2_000)
+    ctx.addEventListener(window, 'blur', () => syncDrafts())
     syncDrafts()
 
     // A different connection invalidates what we knew about the old one. A

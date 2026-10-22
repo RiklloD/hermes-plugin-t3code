@@ -99,7 +99,7 @@ export default {
     ctx.addEventListener(window, 'blur', update)
     ctx.addEventListener(document, 'visibilitychange', update)
     ctx.setInterval(update, CHECK_MS)
-    ctx.setInterval(() => idle && beat(), BEAT_MS)
+    ctx.setInterval(() => idle && !document.hidden && beat(), BEAT_MS)
     update()
   }
 }

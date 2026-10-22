@@ -1497,7 +1497,7 @@ function WorkingTimer({ since }) {
     if (!since) {
       return void 0;
     }
-    const id = window.setInterval(() => setNow(Date.now()), 1e3);
+    const id = window.setInterval(() => !document.hidden && setNow(Date.now()), 1e3);
     return () => window.clearInterval(id);
   }, [since]);
   return since ? h("span", null, workingDuration(now - since)) : null;
@@ -3302,13 +3302,14 @@ var desktop_default = {
     ctx.setInterval(() => $tick.set(Date.now()), 15e3);
     let polledAt = 0;
     ctx.setInterval(() => {
-      if (document.hasFocus() || Date.now() - polledAt >= 1e4) {
+      const every = document.hidden ? 6e4 : document.hasFocus() ? 0 : 1e4;
+      if (Date.now() - polledAt >= every) {
         polledAt = Date.now();
         void pollLive();
       }
     }, 3e3);
     void pollLive();
-    ctx.setInterval(() => void runRecovery(), 1e4);
+    ctx.setInterval(() => void runRecovery(), 3e4);
     void pullLifecycle();
     ctx.setInterval(() => !document.hidden && void pullLifecycle(), 6e4);
     ctx.addEventListener(document, "visibilitychange", () => {
@@ -3318,7 +3319,8 @@ var desktop_default = {
         void pullLifecycle();
       }
     });
-    ctx.setInterval(() => !document.hidden && syncDrafts(), 1e3);
+    ctx.setInterval(() => document.hasFocus() && syncDrafts(), 2e3);
+    ctx.addEventListener(window, "blur", () => syncDrafts());
     syncDrafts();
     let lastConn = activeConn();
     let lastProfile = activeProfile();
@@ -3892,7 +3894,7 @@ var desktop_default2 = {
     ctxRef2 = ctx;
     $now = atom2(Date.now());
     $tasks = atom2({});
-    ctx.setInterval(() => $now.set(Date.now()), 1e3);
+    ctx.setInterval(() => !document.hidden && $now.set(Date.now()), 1e3);
     ctx.setInterval(() => !document.hidden && void refreshTasks(), 3e4);
     void refreshTasks();
     for (const name of ["task.updated", "queue.updated", "lineage.updated", "recovery.updated", "schedules.updated", "session.stopped", "session.turn"]) {
@@ -5395,7 +5397,7 @@ var desktop_default6 = {
     ctx.addEventListener(window, "blur", update);
     ctx.addEventListener(document, "visibilitychange", update);
     ctx.setInterval(update, CHECK_MS);
-    ctx.setInterval(() => idle && beat(), BEAT_MS);
+    ctx.setInterval(() => idle && !document.hidden && beat(), BEAT_MS);
     update();
   }
 };
