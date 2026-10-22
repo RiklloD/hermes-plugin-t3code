@@ -10,10 +10,13 @@ T3 Code's features for [Hermes Agent](https://github.com/NousResearch/hermes-age
 | **Claude CLI** | Claude Code's native agent as the “Claude CLI” model provider |
 | **Muse Code** | Meta's Muse Code agent (`muse serve`) as the “Muse Code” model provider |
 | **Antigravity** | Google's official Antigravity ACP agent as the “Antigravity” model provider |
+| **Battery saver** | Holds Desktop spinners and shimmers to 1 frame a second while Hermes is unfocused or untouched for 30 s |
 | **Native slash commands** | Each native agent's own commands (`/claude:compact`, `/muse:goal`, `/agy:plan`) in Hermes's slash menu |
 
 ## Latest changes
 
+- **Battery saver (new feature, on by default):** on a 120 Hz MacBook, three spinners during a running turn kept the Desktop renderer, GPU process and WindowServer at about 100 % of one core combined. While Hermes is unfocused, hidden or untouched for 30 s, every looping animation is now held and stepped once a second; any input resumes it. Measured drop: renderer 38 % → 4 %, GPU 22 % → 0.7 %, WindowServer 38 % → 7 %.
+- **Fewer background polls:** the goal strip refetches every 15 s instead of 2.5 s (goal changes already arrive as events), the orchestrator overview every 15 s instead of 5 s, its task list every 30 s and never while hidden, and the Inbox live poll every 10 s instead of 3 s while Hermes is unfocused.
 - **Inbox Working shelf:** a thread moves to Working the moment you send, even while its agent is still starting (Claude CLI takes a few seconds). Claude Code's own background shells, monitors and subagents keep a thread in Working after its turn ends.
 - **Context meter:** Claude CLI chats refresh the meter from Claude's own `/context` after every turn, not only when the Context panel opens. A reading taken under another model or 200K/1M setting is dropped instead of showing the wrong window (host patch).
 - **Claude accounts button:** Settings ▸ Plugins ▸ T3 Code ▸ Claude CLI can hide it from the status bar. Hiding it also stops its account check.

@@ -21,6 +21,7 @@ import orchestrator from '../../features/orchestrator/desktop.js'
 import usage from '../../features/usage/desktop.js'
 import claudeCli from '../../features/claude_cli/desktop.js'
 import goals from '../../features/goals/desktop.js'
+import battery from '../../features/battery/desktop.js'
 
 import { FeatureBoundary, featureContext, Invoke, migrateLegacyStorage } from './isolation.js'
 
@@ -37,7 +38,8 @@ const DESKTOP_FEATURES = [
   { key: 'usage', label: 'Usage', legacy: 't3-usage', module: usage },
   { key: 'goals', label: 'Goals', module: goals },
   { key: 'orchestrator', label: 'Orchestrator', legacy: 't3-orchestrator', module: orchestrator },
-  { key: 'claude_cli', label: 'Claude CLI', module: claudeCli }
+  { key: 'claude_cli', label: 'Claude CLI', module: claudeCli },
+  { key: 'battery', label: 'Battery saver', module: battery }
 ]
 // Shown on the overview only (no Desktop half), so every toggle lives in one place.
 const AGENT_ONLY = [
@@ -51,7 +53,8 @@ const DESCRIPTIONS = {
   orchestrator: 'Delegated agents, forks and merge-back, durable queues, recovery and schedules. The agent tools change after a backend restart.',
   claude_cli: 'Claude Code’s native agent as the “Claude CLI” model provider. Applies after a backend restart.',
   muse_code: 'Meta’s Muse Code agent as the “Muse Code” model provider (muse login). Applies after a backend restart.',
-  antigravity: 'Google’s Antigravity agent as the “Antigravity” model provider (own Google sign-in). Applies after a backend restart.'
+  antigravity: 'Google’s Antigravity agent as the “Antigravity” model provider (own Google sign-in). Applies after a backend restart.',
+  battery: 'Holds spinners and shimmers to 1 frame a second while Hermes is unfocused or untouched for 30 s; they resume on any input. Applies live.'
 }
 
 let ctxRef = null

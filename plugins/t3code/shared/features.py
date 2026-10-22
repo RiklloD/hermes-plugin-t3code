@@ -58,6 +58,7 @@ FEATURES: Dict[str, Feature] = {
         Feature("claude_cli", "Claude CLI", "claude-cli", api=True, restart=True),
         Feature("muse_code", "Muse Code", "muse-code", restart=True),
         Feature("antigravity", "Antigravity", "antigravity", restart=True),
+        Feature("battery", "Battery saver", ""),
     )
 }
 

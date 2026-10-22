@@ -4244,8 +4244,15 @@ export default {
     // Coarse clock for relative ages, snooze expiry and auto-settle; working
     // timers tick themselves and snooze wakes are scheduled exactly.
     ctx.setInterval(() => $tick.set(Date.now()), 15_000)
-    // Live turn state for the sources we can reach (skipped while hidden).
-    ctx.setInterval(() => void pollLive(), 3_000)
+    // Live turn state for the sources we can reach (skipped while hidden; every 10 s instead of 3 s
+    // while Hermes sits unfocused, since each poll is two calls per opened profile).
+    let polledAt = 0
+    ctx.setInterval(() => {
+      if (document.hasFocus() || Date.now() - polledAt >= 10_000) {
+        polledAt = Date.now()
+        void pollLive()
+      }
+    }, 3_000)
     void pollLive()
     // Resume threads a crash or a usage limit stopped (see "recovery" above).
     ctx.setInterval(() => void runRecovery(), 10_000)

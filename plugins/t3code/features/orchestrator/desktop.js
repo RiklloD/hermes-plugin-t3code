@@ -153,7 +153,8 @@ function useOverview(key, profile) {
     queryFn: () =>
       rest(`/overview?session_key=${encodeURIComponent(key)}${profile ? `&profile=${encodeURIComponent(profile)}` : ''}`),
     queryKey: [NS, 'overview', key],
-    refetchInterval: 5000,
+    // Orchestrator events invalidate this on every change; the poll is a backstop.
+    refetchInterval: 15_000,
     retry: false
   })
 }
@@ -429,7 +430,7 @@ export default {
     $now = atom(Date.now())
     $tasks = atom({})
     ctx.setInterval(() => $now.set(Date.now()), 1000)
-    ctx.setInterval(() => void refreshTasks(), 10_000)
+    ctx.setInterval(() => !document.hidden && void refreshTasks(), 30_000)
     void refreshTasks()
 
     for (const name of ['task.updated', 'queue.updated', 'lineage.updated', 'recovery.updated', 'schedules.updated', 'session.stopped', 'session.turn']) {

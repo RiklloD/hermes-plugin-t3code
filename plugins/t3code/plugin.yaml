@@ -62,6 +62,11 @@ config_schema:
     default: true
     label: Antigravity
     description: Google's official Antigravity ACP agent as the "Antigravity" model provider. Applies after a backend restart.
+  battery:
+    type: boolean
+    default: true
+    label: Battery saver
+    description: Holds Desktop spinners and shimmers to 1 frame a second while Hermes is unfocused or untouched for 30 s. Applies live.
   inject_soul:
     type: boolean
     default: true

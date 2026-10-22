@@ -3300,7 +3300,13 @@ var desktop_default = {
     lastVisibleKeys = [];
     connGeneration += 1;
     ctx.setInterval(() => $tick.set(Date.now()), 15e3);
-    ctx.setInterval(() => void pollLive(), 3e3);
+    let polledAt = 0;
+    ctx.setInterval(() => {
+      if (document.hasFocus() || Date.now() - polledAt >= 1e4) {
+        polledAt = Date.now();
+        void pollLive();
+      }
+    }, 3e3);
     void pollLive();
     ctx.setInterval(() => void runRecovery(), 1e4);
     void pullLifecycle();
@@ -3609,7 +3615,8 @@ function useOverview(key, profile) {
     enabled: !!key,
     queryFn: () => rest(`/overview?session_key=${encodeURIComponent(key)}${profile ? `&profile=${encodeURIComponent(profile)}` : ""}`),
     queryKey: [NS2, "overview", key],
-    refetchInterval: 5e3,
+    // Orchestrator events invalidate this on every change; the poll is a backstop.
+    refetchInterval: 15e3,
     retry: false
   });
 }
@@ -3886,7 +3893,7 @@ var desktop_default2 = {
     $now = atom2(Date.now());
     $tasks = atom2({});
     ctx.setInterval(() => $now.set(Date.now()), 1e3);
-    ctx.setInterval(() => void refreshTasks(), 1e4);
+    ctx.setInterval(() => !document.hidden && void refreshTasks(), 3e4);
     void refreshTasks();
     for (const name of ["task.updated", "queue.updated", "lineage.updated", "recovery.updated", "schedules.updated", "session.stopped", "session.turn"]) {
       ctx.onEvent(EVENT(name), (ev) => {
@@ -4774,7 +4781,7 @@ function UsageGraft() {
   useLayoutEffect(() => {
     let current = null;
     let hidden = null;
-    const release = () => {
+    const release2 = () => {
       current?.content.removeAttribute("data-t3u-active");
       hidden?.removeAttribute("data-t3u-hide");
       current = null;
@@ -4783,7 +4790,7 @@ function UsageGraft() {
     const tick = () => {
       const next = findUsageTarget();
       if (next?.content !== current?.content) {
-        release();
+        release2();
         current = next;
         setTarget(next);
       }
@@ -4807,7 +4814,7 @@ function UsageGraft() {
       observer.disconnect();
       window.removeEventListener("hashchange", tick);
       window.removeEventListener("popstate", tick);
-      release();
+      release2();
     };
   }, []);
   return target ? portal(h3("div", { "data-t3u-host": "" }, h3(GraftBoundary, null, h3(UsagePage, { grafted: true }))), target.content) : null;
@@ -5290,8 +5297,9 @@ function GoalStrip() {
     queryKey: [QUERY2, owner?.connectionId, owner?.profile, sessionId, runtimeId],
     queryFn: () => fetchGoal(owner, sessionId, runtimeId),
     enabled: Boolean(sessionId && owner?.connectionId && owner?.profile),
-    // Back off while the backend errors (e.g. 503) instead of hammering it every 2.5s.
-    refetchInterval: (q) => q.state.status === "error" ? 3e4 : 2500,
+    // Goal edits arrive through the events below; this poll is only a backstop (each fetch scans
+    // the thread's messages in state.db, so 2.5 s kept a gateway worker busy). Back off on errors.
+    refetchInterval: (q) => q.state.status === "error" ? 6e4 : 15e3,
     staleTime: 1e3,
     retry: 1
   });
@@ -5313,6 +5321,82 @@ var desktop_default5 = {
     for (const event of ["session.control.update", "session.resumed", "session.info", "turn.completed", "message.final"]) {
       ctx.onEvent(event, () => void queryClient5.invalidateQueries({ queryKey: [QUERY2] }));
     }
+  }
+};
+
+// features/battery/desktop.js
+var HOLD_ATTR = "data-t3-battery-hold";
+var IDLE_MS = 3e4;
+var BEAT_MS = 1e3;
+var CHECK_MS = 5e3;
+var CSS4 = `[${HOLD_ATTR}],[${HOLD_ATTR}]::before,[${HOLD_ATTR}]::after{animation-play-state:paused!important}`;
+var held = /* @__PURE__ */ new Set();
+var idle = false;
+var lastInput = Date.now();
+var isLooping = (a) => a.effect?.getTiming?.().iterations === Infinity && a.effect?.target?.setAttribute;
+function holdRunning() {
+  for (const a of document.getAnimations()) {
+    if (a.playState === "running" && isLooping(a) && !held.has(a)) {
+      a.effect.target.setAttribute(HOLD_ATTR, "");
+      held.add(a);
+    }
+  }
+}
+function beat() {
+  for (const a of held) {
+    if (!a.effect?.target?.isConnected || a.playState === "idle") {
+      held.delete(a);
+    } else if (a.playState === "paused") {
+      a.currentTime = (a.currentTime || 0) + BEAT_MS;
+    }
+  }
+  holdRunning();
+}
+function release() {
+  for (const a of held) {
+    a.effect?.target?.removeAttribute?.(HOLD_ATTR);
+  }
+  held = /* @__PURE__ */ new Set();
+}
+function shouldIdle() {
+  return document.hidden || !document.hasFocus() || Date.now() - lastInput > IDLE_MS;
+}
+function update() {
+  const next = shouldIdle();
+  if (next === idle) {
+    return;
+  }
+  idle = next;
+  idle ? holdRunning() : release();
+}
+function onInput() {
+  lastInput = Date.now();
+  if (idle) {
+    update();
+  }
+}
+var desktop_default6 = {
+  register(ctx) {
+    held = /* @__PURE__ */ new Set();
+    idle = false;
+    lastInput = Date.now();
+    const style = document.createElement("style");
+    style.dataset.t3Battery = "";
+    style.textContent = CSS4;
+    document.head.appendChild(style);
+    ctx.onDispose(() => {
+      release();
+      style.remove();
+    });
+    for (const type of ["pointerdown", "pointermove", "keydown", "wheel"]) {
+      ctx.addEventListener(window, type, onInput, { capture: true, passive: true });
+    }
+    ctx.addEventListener(window, "focus", onInput);
+    ctx.addEventListener(window, "blur", update);
+    ctx.addEventListener(document, "visibilitychange", update);
+    ctx.setInterval(update, CHECK_MS);
+    ctx.setInterval(() => idle && beat(), BEAT_MS);
+    update();
   }
 };
 
@@ -5510,7 +5594,8 @@ var DESKTOP_FEATURES = [
   { key: "usage", label: "Usage", legacy: "t3-usage", module: desktop_default3 },
   { key: "goals", label: "Goals", module: desktop_default5 },
   { key: "orchestrator", label: "Orchestrator", legacy: "t3-orchestrator", module: desktop_default2 },
-  { key: "claude_cli", label: "Claude CLI", module: desktop_default4 }
+  { key: "claude_cli", label: "Claude CLI", module: desktop_default4 },
+  { key: "battery", label: "Battery saver", module: desktop_default6 }
 ];
 var AGENT_ONLY = [
   { key: "muse_code", label: "Muse Code" },
@@ -5523,7 +5608,8 @@ var DESCRIPTIONS = {
   orchestrator: "Delegated agents, forks and merge-back, durable queues, recovery and schedules. The agent tools change after a backend restart.",
   claude_cli: "Claude Code\u2019s native agent as the \u201CClaude CLI\u201D model provider. Applies after a backend restart.",
   muse_code: "Meta\u2019s Muse Code agent as the \u201CMuse Code\u201D model provider (muse login). Applies after a backend restart.",
-  antigravity: "Google\u2019s Antigravity agent as the \u201CAntigravity\u201D model provider (own Google sign-in). Applies after a backend restart."
+  antigravity: "Google\u2019s Antigravity agent as the \u201CAntigravity\u201D model provider (own Google sign-in). Applies after a backend restart.",
+  battery: "Holds spinners and shimmers to 1 frame a second while Hermes is unfocused or untouched for 30 s; they resume on any input. Applies live."
 };
 var ctxRef4 = null;
 var $toggles = null;
