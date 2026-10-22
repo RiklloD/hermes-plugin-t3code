@@ -95,8 +95,10 @@ class TaskRegistry:
         meta, log, exit_file = self._paths(task_id)
         query = meta.with_suffix(".prompt")
         query.write_text(task)
+        # The gateway's session authority accepts only its own surfaces (cli, tui, gui, acp, tool,
+        # oneshot); "tool" runs as the CLI and keeps the run out of the human session pickers.
         argv = [self.hermes, "-p", profile, "chat", "--query-file", str(query), "-Q",
-                "--source", "claude-cli", "--in", workdir]
+                "--source", "tool", "--in", workdir]
         if worktree:
             argv.append("--worktree")
         process = subprocess.Popen([sys.executable, "-I", "-c", _WRAPPER, str(log), str(exit_file), *argv],

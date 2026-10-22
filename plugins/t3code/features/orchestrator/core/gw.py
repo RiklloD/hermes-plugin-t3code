@@ -17,6 +17,8 @@ import time
 import uuid
 from typing import Any, Callable, Optional
 
+from . import authority as auth
+
 logger = logging.getLogger("t3o.gw")
 
 TAP_MARK = "_t3o_tap_installed"
@@ -50,18 +52,30 @@ def server():
 
 
 def available() -> bool:
+    if auth.active():
+        return True
     srv = server()
     return srv is not None and hasattr(srv, "handle_request")
 
 
 def is_serve_process() -> bool:
-    """True inside ``hermes serve`` / the dashboard (WS gateway, not the stdio TUI)."""
+    """True inside the process that owns Desktop sessions: the gateway's session authority
+    (current Hermes), or ``hermes serve`` / the dashboard (WS gateway, not the stdio TUI)."""
+    if auth.active():
+        return True
     srv = server()
     return srv is not None and not getattr(srv, "_stdio_is_rpc_channel", False)
 
 
 def call(method: str, params: Optional[dict] = None, *, timeout: float = 120.0) -> dict:
     """Run one gateway RPC in-process with a null transport bound; return ``result`` or raise."""
+    if auth.active():
+        params = dict(params or {})
+        home = profile_home(params["profile"]) if params.get("profile") else None
+        try:
+            return auth.call(method, params, home=home, timeout=timeout)
+        except auth.AuthorityError as exc:
+            raise GatewayError(exc.code, str(exc), exc.data) from exc
     srv = server()
     if srv is None:
         raise GatewayError("unavailable", "The Hermes Desktop backend is not running in this process.")
@@ -88,6 +102,8 @@ def call(method: str, params: Optional[dict] = None, *, timeout: float = 120.0) 
 # ── session lookup ──────────────────────────────────────────────────────────
 
 def sessions_snapshot() -> list[tuple[str, dict]]:
+    if auth.active():
+        return auth.snapshot()
     srv = server()
     if srv is None:
         return []
@@ -104,6 +120,8 @@ def live_for_key(key: str) -> tuple[Optional[str], Optional[dict]]:
     """``(runtime sid, session record)`` of the live session whose stored key is ``key``."""
     if not key:
         return None, None
+    if auth.active():
+        return auth.live_for_key(key)
     for sid, s in sessions_snapshot():
         if s.get("_finalized") or s.get("_closing"):
             continue
@@ -113,6 +131,9 @@ def live_for_key(key: str) -> tuple[Optional[str], Optional[dict]]:
 
 
 def key_for_sid(sid: str) -> str:
+    if auth.active():
+        a, key = auth.locate(sid)
+        return key if a is not None else ""
     srv = server()
     if srv is None or not sid:
         return ""
@@ -125,6 +146,8 @@ def key_for_sid(sid: str) -> str:
 def session_for_agent(agent: Any) -> tuple[Optional[str], Optional[dict]]:
     if agent is None:
         return None, None
+    if auth.active():
+        return live_for_key(str(getattr(agent, "session_id", "") or ""))
     for sid, s in sessions_snapshot():
         if s.get("agent") is agent:
             return sid, s
@@ -200,6 +223,16 @@ def ensure_live(key: str, profile: Optional[str] = None, *, build: bool = True) 
     sid, s = live_for_key(key)
     if sid is not None:
         return sid, s
+    if auth.active():
+        home = profile_home(profile) if profile else None
+        try:
+            auth.call("session.resume", {"session_id": key}, home=home)
+        except auth.AuthorityError as exc:
+            raise GatewayError(exc.code, str(exc), exc.data) from exc
+        sid, s = live_for_key(key)
+        if sid is None:
+            raise GatewayError("resume_failed", f"could not open session {key}")
+        return sid, s
     params: dict = {"session_id": key, "omit_messages": True, "eager_build": bool(build)}
     if profile:
         params["profile"] = profile
@@ -213,6 +246,8 @@ def ensure_live(key: str, profile: Optional[str] = None, *, build: bool = True) 
 
 
 def wait_ready(session: dict, timeout: float = 120.0) -> bool:
+    if session.get("_authority") is not None:
+        return True  # the authority builds the agent when it claims the turn
     ev = session.get("agent_ready")
     if ev is None:
         return session.get("agent") is not None
@@ -227,7 +262,27 @@ def deliver_turn(sid: str, session: dict, text: str, *, display_kind: Optional[s
     Claim (``_notif_claim_turn``), the ``guard`` / Stop-latch re-check and the host admission
     (``_run_prompt_submit``, which returns after admission and runs the turn on its own thread)
     happen under ``lock`` — the lock the Stop observer takes — so a Stop can never land between
-    the checks and the submission. Any refusal releases the claim."""
+    the checks and the submission. Any refusal releases the claim.
+
+    On the session authority the turn is a durable FIFO admission (``prompt.submit``) authored by
+    the orchestrator; the session must be idle with nothing queued when it is admitted."""
+    if session.get("_authority") is not None:
+        with (lock if lock is not None else contextlib.nullcontext()):
+            if guard is not None and not guard():
+                return False
+            fresh = auth.record(session["_authority"], sid)
+            if fresh is None or fresh["running"] or fresh["queued_prompt"]:
+                return False
+            author = dict(auth.AUTHOR)
+            label = (display_metadata or {}).get("display_text")
+            if isinstance(label, str) and label:
+                author["name"] = f"T3 · {label}"[:120]
+            try:
+                call("prompt.submit", {"session_id": sid, "text": text, "turn_author": author})
+                return True
+            except Exception:
+                logger.warning("t3o: automatic turn failed for %s", sid, exc_info=True)
+                return False
     srv = server()
     if srv is None:
         return False
@@ -276,8 +331,29 @@ def interrupt(sid: str) -> bool:
 
 # ── observation ─────────────────────────────────────────────────────────────
 
+_HOOKS: dict = {"tap": None, "methods": {}, "installed": False}
+
+
+def poll_install() -> None:
+    """Install the session-authority hooks once the gateway has built its authority (the plugin
+    loads before the runner exists). Cheap after the first success."""
+    if _HOOKS["installed"] or not auth.active():
+        return
+    ok = True
+    if _HOOKS["tap"] is not None:
+        ok = auth.install_tap(_HOOKS["tap"]) and ok
+    for name, (before, after) in _HOOKS["methods"].items():
+        ok = auth.wrap_method(name, before, after) and ok
+    _HOOKS["installed"] = ok
+    if ok:
+        logger.info("t3o: attached to the gateway session authority")
+
+
 def install_tap(sink: Callable[[str, str, dict], None]) -> bool:
     """Observe every session event frame. Idempotent; never alters or delays delivery."""
+    _HOOKS["tap"] = sink
+    _HOOKS["installed"] = False
+    poll_install()
     srv = server()
     if srv is None:
         return False
@@ -307,6 +383,10 @@ def install_tap(sink: Callable[[str, str, dict], None]) -> bool:
 def wrap_method(name: str, before: Optional[Callable[[dict], None]] = None,
                 after: Optional[Callable[[dict, Any], None]] = None) -> bool:
     """Observe one RPC method (user Stop, user prompts). The original handler always runs."""
+    if name in ("session.interrupt", "prompt.submit"):
+        _HOOKS["methods"][name] = (before, after)
+        _HOOKS["installed"] = False
+        poll_install()
     srv = server()
     if srv is None:
         return False
@@ -417,6 +497,9 @@ def ok(rid: Any, result: dict) -> dict:
 
 def emit(event: str, sid: str, payload: dict) -> None:
     """Send one session event to whatever clients view ``sid`` (best effort)."""
+    if auth.active():
+        auth.emit(event, sid, payload)
+        return
     srv = server()
     if srv is None or not sid:
         return

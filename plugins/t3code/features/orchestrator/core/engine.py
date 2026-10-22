@@ -168,6 +168,8 @@ class Engine:
         gw.wrap_global("_stop_turns_before_exit", self.prepare_for_shutdown)
         logger.info("t3code orchestrator engine attached (owner=%s)", self._claim_owner())
         while True:
+            with contextlib.suppress(Exception):
+                gw.poll_install()  # the gateway's session authority appears after plugins load
             try:
                 kind, sid, payload = self.events.get(timeout=1.0)
                 self._handle(kind, sid, payload)
@@ -386,6 +388,10 @@ class Engine:
     def _key_of_sid(self, sid: str) -> tuple[str, Optional[str]]:
         """(lineage root, profile) of a live runtime session."""
         key = gw.key_for_sid(sid)
+        if gw.auth.active():
+            # Authority ids are already the logical owner (the compression lineage root).
+            _, session = gw.live_for_key(key) if key else (None, None)
+            return key, gw.profile_of(session)
         srv = gw.server()
         session = srv._sessions.get(sid) if srv is not None else None
         profile = gw.profile_of(session) if isinstance(session, dict) else None
@@ -443,6 +449,8 @@ class Engine:
             raise OrchestratorError("parent_not_active",
                                     "No live Hermes Desktop session owns this call. Orchestration tools run inside "
                                     "a Desktop/TUI session served by `hermes serve`.")
+        if session.get("_authority") is not None:
+            return sid, session, str(session["session_key"])
         key = str(getattr(session.get("agent"), "session_id", "") or session.get("session_key") or "")
         return sid, session, self.root(key, gw.profile_of(session))
 
@@ -1269,6 +1277,8 @@ class Engine:
     def _live_entries(self) -> dict[str, dict]:
         """This process's running turns, and idle threads waiting on background work, by lineage root."""
         out: dict[str, dict] = {}
+        if gw.auth.active():
+            return out  # the session authority's durable FIFO recovers cut turns itself
         registry = getattr(sys.modules.get("tools.process_registry"), "process_registry", None)
         background = bool(chatframe.NATIVE) or bool(getattr(registry, "_running", None))
         for sid, s in gw.sessions_snapshot():
