@@ -5144,8 +5144,18 @@ var desktop_default4 = {
   register(ctx) {
     featureCtx = ctx;
     $showAccounts = atom4(ctx.storage.get("showAccounts", true) !== false);
-    ctx.register({ id: "context-window", area: "statusBar.right", order: -10, render: () => h4(ContextPicker) });
-    ctx.register({ id: "claude-accounts", area: "statusBar.right", order: -9, render: () => h4(AccountsSlot) });
+    ctx.register({
+      id: "context-window",
+      area: "statusBar.right",
+      order: -10,
+      data: { id: "claude_cli-context-window", toggleLabel: "Claude context window", render: () => h4(ContextPicker) }
+    });
+    ctx.register({
+      id: "claude-accounts",
+      area: "statusBar.right",
+      order: -9,
+      data: { id: "claude_cli-claude-accounts", toggleLabel: "Claude accounts", render: () => h4(AccountsSlot) }
+    });
     ctx.registerSettingsPage?.({ icon: "user", id: "settings", render: () => h4(SettingsPage3), title: "Claude CLI" });
     ctx.onEvent("session.info", () => {
       void queryClient4.invalidateQueries({ queryKey: [QUERY] });

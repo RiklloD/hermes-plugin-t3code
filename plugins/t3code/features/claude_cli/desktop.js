@@ -158,8 +158,12 @@ export default {
   register(ctx) {
     featureCtx = ctx
     $showAccounts = atom(ctx.storage.get('showAccounts', true) !== false)
-    ctx.register({ id: 'context-window', area: 'statusBar.right', order: -10, render: () => h(ContextPicker) })
-    ctx.register({ id: 'claude-accounts', area: 'statusBar.right', order: -9, render: () => h(AccountsSlot) })
+    // Render-only contributions lose toggle metadata in the host adapter.
+    // Data items keep their stable ids and use the bar's persisted visibility menu.
+    ctx.register({ id: 'context-window', area: 'statusBar.right', order: -10,
+      data: { id: 'claude_cli-context-window', toggleLabel: 'Claude context window', render: () => h(ContextPicker) } })
+    ctx.register({ id: 'claude-accounts', area: 'statusBar.right', order: -9,
+      data: { id: 'claude_cli-claude-accounts', toggleLabel: 'Claude accounts', render: () => h(AccountsSlot) } })
     ctx.registerSettingsPage?.({ icon: 'user', id: 'settings', render: () => h(SettingsPage), title: 'Claude CLI' })
     ctx.onEvent('session.info', () => {
       void queryClient.invalidateQueries({ queryKey: [QUERY] })
